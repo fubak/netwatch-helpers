@@ -33,6 +33,7 @@ When to use: Use to find open ports and services inside the LAN, what is exposed
    ```bash
    python3 /workspace/nw-helpers/wan_probe.py --ip WAN_IP --confirmed-by-router
    ```
+   With an IP from upnp_check.py, CopyToBox the scan host's `NETWATCH_HOME/upnp/latest.json` and use `--upnp-file /workspace/nw-upnp-latest.json` instead of `--confirmed-by-router`; the probe is refused when that record is over an hour old, is not from the default gateway, or names a different IP.
    It does plain TCP connects to about 20 common ports, no payloads or logins. IPv6 hosts can only be probed if the box has IPv6 egress (it usually does not); otherwise rely on the router's IPv6 rule review in B3.
 4. Every open port must map to a port forward the owner knows about; anything else is a finding. tcp/7547 open means the ISP's TR-069 management is exposed; tell the owner to raise it with the ISP.
 

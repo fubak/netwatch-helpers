@@ -10,7 +10,13 @@ Installs nothing. Usage:
   preflight.py --detect            setup facts for one confirm card: LAN interface, IP/CIDR,
                                    default gateway, gateway MAC (neighbor table), vendor guess
                                    from the OUI, tools, linger/ufw/relay ports, env keys set or
-                                   MISSING (never values). Add --json for JSON.
+                                   MISSING (never values), plus host and network checks (VPN, managed
+                                   computer, admin rights, battery and sleep, Store Python stub, host
+                                   firewall, IPv6). Add --json for JSON. --probe (only after scope
+                                   consent) adds one SSDP search, one GET of the gateway's own page, and
+                                   on macOS the Local Network check: router brand (OUI, then UPnP, then
+                                   page title), WAN type (public, double NAT, CGNAT). Failed checks print
+                                   "not checked".
   preflight.py --env-template [--gear unifi|none] [--no-alerts]
                                    print an env file template with placeholders only; the
                                    gateway is prefilled. Never opens the env file and never writes.
@@ -29,6 +35,7 @@ Installs nothing. Usage:
 """
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -97,8 +104,19 @@ BUILTIN_OUI = {
 NMAP_PREFIX_FILES = ("/usr/share/nmap/nmap-mac-prefixes", "/usr/local/share/nmap/nmap-mac-prefixes",
                      "/opt/homebrew/share/nmap/nmap-mac-prefixes",
                      r"C:\Program Files (x86)\Nmap\nmap-mac-prefixes", r"C:\Program Files\Nmap\nmap-mac-prefixes")
-GEAR_BY_VENDOR = [(r"ubiquiti", "unifi"), (r"tp-?link", "tp-link (omada or consumer)"), (r"asustek|\basus", "asus"),
-                  (r"eero", "eero"), (r"netgate", "pfsense"), (r"firewalla", "firewalla"), (r"netgear", "netgear")]
+GEAR_BY_VENDOR = [(r"ubiquiti|unifi", "unifi"), (r"tp-?link", "tp-link (omada or consumer)"), (r"asustek|\basus", "asus"),
+                  (r"eero", "eero"), (r"netgate", "pfsense"), (r"firewalla", "firewalla"), (r"netgear", "netgear"),
+                  (r"google|\bnest\b", "google-nest"), (r"linksys|belkin", "linksys")]
+# Makers that mostly build ISP-supplied gateways: the owner may still log in, so this only shapes the consent wording.
+ISP_MAKERS = re.compile(r"arris|commscope|sagemcom|technicolor|vantiva|askey|humax|calix|nokia|zyxel|actiontec|sercomm|"
+                        r"hitron|greenwave|mitrastar|adb broadband|\bpace\b|\bwnc\b|xfinity|comcast|verizon|at&t|spectrum", re.I)
+# Login page titles (read-only GET of the gateway's own page, no credentials) for when OUI and UPnP give nothing.
+TITLE_GEAR = [(r"unifi", "unifi"), (r"asuswrt|asus wireless|\basus\b", "asus"), (r"opnsense", "opnsense"), (r"pfsense", "pfsense"),
+              (r"omada", "tp-link (omada or consumer)"), (r"\bdeco\b|tp-?link", "tp-link (omada or consumer)"),
+              (r"netgear|orbi", "netgear"), (r"linksys|velop", "linksys"), (r"firewalla", "firewalla")]
+VPN_IFACE = re.compile(r"^(tun|tap|wg|utun|ppp|ipsec|zt|tailscale|nordlynx|proton|gpd|cscotun)\d*|vpn|wireguard|openvpn|"
+                       r"tap-windows|tailscale|zerotier|anyconnect|globalprotect|fortinet|forticlient|nordlynx|mullvad|pangp", re.I)
+NC = "not checked"
 ALERT_KEYS = ["ALERT_SOURCES", "ALERT_INBOUND_TOKEN", "ROUTINE_WEBHOOK_URL", "ROUTINE_WEBHOOK_KEY"]
 UNIFI_KEYS = ["UNIFI_HOST", "UNIFI_USER", "UNIFI_PASS", "UNIFI_API_KEY"]
 
@@ -133,6 +151,343 @@ def gear_guess(vendor):
     return ""
 
 
+def isp_guess(text):
+    return "yes" if ISP_MAKERS.search(text or "") else "no"
+
+
+def title_gear(title):
+    for pat, gear in TITLE_GEAR:
+        if re.search(pat, title or "", re.I):
+            return gear
+    return "isp-router" if ISP_MAKERS.search(title or "") else ""
+
+
+def router_brand(vendor="", upnp=None, title=""):
+    """(gear, source): gateway MAC vendor first, then the UPnP description, then the login page title."""
+    g = gear_guess(vendor)
+    if g:
+        return g, "oui"
+    upnp = upnp or {}
+    utext = " ".join(str(upnp.get(k) or "") for k in ("manufacturer", "model", "model_number", "friendly_name"))
+    g = gear_guess(utext) or ("isp-router" if ISP_MAKERS.search(utext) else "")
+    if g:
+        return g, "upnp"
+    g = title_gear(title)
+    if g:
+        return g, "title"
+    return "", NC
+
+
+def private_v4(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return a.version == 4 and any(a in n for n in nw.RFC1918)
+
+
+def classify_wan(ip):
+    """WAN type from the address the router itself reports (UniFi or UPnP external_ip)."""
+    try:
+        a = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return NC
+    if a.version == 4 and a in ipaddress.ip_network("100.64.0.0/10"):
+        return "cgnat"
+    if a.is_private or a.is_link_local:
+        return "double-nat"
+    if a.is_global:
+        return "public"
+    return NC
+
+
+def vpn_route(iface, desc=""):
+    return "yes" if VPN_IFACE.search(iface or "") or VPN_IFACE.search(desc or "") else "no"
+
+
+def battery_state(osf, power_dir="/sys/class/power_supply", runner=None):
+    """yes, no, or not checked. Linux reads power_supply, macOS pmset, Windows Win32_Battery."""
+    runner = runner or _quiet
+    if osf == "linux":
+        try:
+            kinds = []
+            for d in os.listdir(power_dir):
+                try:
+                    with open(os.path.join(power_dir, d, "type"), encoding="ascii", errors="replace") as fh:
+                        kinds.append(fh.read().strip())
+                except OSError:
+                    continue
+        except OSError:
+            return NC
+        return "yes" if "Battery" in kinds else "no"
+    if osf == "macos":
+        rc, out = runner(["pmset", "-g", "batt"])
+        return NC if rc != 0 else ("yes" if "InternalBattery" in out else "no")
+    rc, out = runner(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Battery | Measure-Object).Count"])
+    out = out.strip()
+    return NC if rc != 0 or not out.isdigit() else ("yes" if int(out) > 0 else "no")
+
+
+def sleep_state(osf, runner=None):
+    """never (stays awake on mains power), enabled, or not checked."""
+    runner = runner or _quiet
+    if osf == "linux":
+        rc, out = runner(["systemctl", "is-enabled", "suspend.target"])
+        if out.strip() == "masked":
+            return "never"
+        rc2, out2 = runner(["gsettings", "get", "org.gnome.settings-daemon.plugins.power", "sleep-inactive-ac-type"])
+        if rc2 == 0 and out2.strip().strip("'") == "nothing":
+            return "never"
+        if rc2 == 0 and out2.strip():
+            return "enabled"
+        return "enabled" if rc == 0 and out.strip() in ("static", "enabled", "indirect") else NC
+    if osf == "macos":
+        rc, out = runner(["pmset", "-g"])
+        m = re.search(r"^\s*sleep\s+(\d+)", out, re.M) if rc == 0 else None
+        return NC if not m else ("never" if m.group(1) == "0" else "enabled")
+    rc, out = runner(["powercfg", "/query", "SCHEME_CURRENT", "SUB_SLEEP", "STANDBYIDLE"])
+    m = re.search(r"Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)", out) if rc == 0 else None
+    return NC if not m else ("never" if int(m.group(1), 16) == 0 else "enabled")
+
+
+def store_python_stub(osf, which=shutil.which, size=os.path.getsize):
+    """Windows: a 0-byte python.exe under WindowsApps is the Microsoft Store stub (opens the Store, runs nothing)."""
+    if osf != "windows":
+        return "n/a"
+    hits = []
+    for name in ("python", "python3"):
+        p = which(name)
+        try:
+            if p and "windowsapps" in p.lower() and size(p) == 0:
+                hits.append(name)
+        except OSError:
+            continue
+    return ("store-stub: " + ",".join(hits) + " (use py -3)") if hits else "no"
+
+
+def admin_rights(osf, groups=None, runner=None):
+    """Can this user elevate at all (sudo, admin group, Administrators)? Net Watch itself never elevates."""
+    runner = runner or _quiet
+    if osf == "windows":
+        rc, out = runner(["whoami", "/groups"])
+        return NC if rc != 0 else ("yes" if "S-1-5-32-544" in out else "no")
+    if groups is None:
+        try:
+            import grp
+            groups = {grp.getgrgid(g).gr_name for g in os.getgroups()}
+        except (ImportError, KeyError, OSError):
+            return NC
+    want = {"admin"} if osf == "macos" else {"sudo", "wheel", "admin"}
+    return "yes" if want & set(groups) or (hasattr(os, "geteuid") and os.geteuid() == 0) else "no"
+
+
+def managed_machine(osf, runner=None, exists=os.path.exists, env=None):
+    """yes when the computer looks company-managed (MDM, domain or Entra join, sssd/realm)."""
+    runner = runner or _quiet
+    env = os.environ if env is None else env
+    if osf == "macos":
+        rc, out = runner(["profiles", "status", "-type", "enrollment"])
+        if rc != 0:
+            return NC
+        return "yes" if re.search(r"MDM enrollment:\s*Yes", out, re.I) else "no"
+    if osf == "windows":
+        rc, out = runner(["dsregcmd", "/status"])
+        if rc == 0 and re.search(r"(AzureAdJoined|DomainJoined|EnterpriseJoined)\s*:\s*YES", out, re.I):
+            return "yes"
+        return "no" if rc == 0 else NC
+    return "yes" if exists("/etc/sssd/sssd.conf") or exists("/etc/krb5.keytab") else "no"
+
+
+def host_firewall(osf, runner=None):
+    """Which host firewall is on (it can block the relay ports). Read-only."""
+    runner = runner or _quiet
+    if osf == "linux":
+        found = []
+        rc, out = runner(["systemctl", "is-active", "ufw"])
+        if out.strip() == "active":
+            found.append("ufw")
+        rc, out = runner(["systemctl", "is-active", "firewalld"])
+        if out.strip() == "active":
+            found.append("firewalld")
+        return ",".join(found) or "none found"
+    if osf == "macos":
+        rc, out = runner(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"])
+        if rc != 0:
+            return NC
+        return "app-firewall-on" if re.search(r"enabled|state = [12]", out, re.I) else "off"
+    rc, out = runner(["powershell", "-NoProfile", "-Command",
+                      "Get-NetFirewallProfile | ForEach-Object { $_.Name + '=' + $_.Enabled }"])
+    on = [ln.split("=")[0].strip() for ln in out.splitlines() if ln.strip().lower().endswith("=true")]
+    return NC if rc != 0 else ("windows-defender:" + ",".join(on) if on else "off")
+
+
+def network_profile(osf, runner=None):
+    """Windows network category (Public blocks inbound relay traffic by default)."""
+    if osf != "windows":
+        return "n/a"
+    runner = runner or _quiet
+    rc, out = runner(["powershell", "-NoProfile", "-Command", "(Get-NetConnectionProfile | Select-Object -First 1).NetworkCategory"])
+    out = out.strip()
+    return out if rc == 0 and re.fullmatch(r"[A-Za-z]{3,20}", out) else NC
+
+
+def default_route_desc(osf, runner=None):
+    """Windows: adapter description and alias of the default route (to spot a VPN adapter)."""
+    if osf != "windows":
+        return ""
+    runner = runner or _quiet
+    rc, out = runner(["powershell", "-NoProfile", "-Command",
+                      "Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1 | "
+                      "ForEach-Object { (Get-NetAdapter -InterfaceIndex $_.ifIndex).InterfaceDescription + ' ' + $_.InterfaceAlias }"])
+    return out.strip()[:120] if rc == 0 else ""
+
+
+def ipv6_state(connect=None):
+    """global, link-local only, or not checked. A UDP connect picks a source address and sends nothing."""
+    def _default(dst):
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        try:
+            s.connect((dst, 53))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    try:
+        addr = (connect or _default)("2001:db8::1")
+    except OSError:
+        return "link-local only or off"
+    except Exception:  # noqa: BLE001
+        return NC
+    try:
+        a = ipaddress.ip_address(str(addr).split("%")[0])
+    except ValueError:
+        return NC
+    if a.is_global or (a.version == 6 and not a.is_link_local and not a.is_loopback and not a.is_private):
+        return "global"
+    return "link-local only or off" if a.is_link_local or a.is_loopback else "private (ULA) only"
+
+
+def local_network_state(osf, gw, connect=None):
+    """macOS only: a denied Local Network permission makes LAN connects fail with EHOSTUNREACH even to the gateway."""
+    if osf != "macos":
+        return "n/a"
+    if not gw:
+        return NC
+    def _default(host, port):
+        with socket.create_connection((host, port), timeout=1.5):
+            return True
+    for port in (443, 80):
+        try:
+            (connect or _default)(gw, port)
+            return "ok"
+        except ConnectionRefusedError:
+            return "ok"
+        except socket.timeout:
+            continue
+        except OSError as e:
+            if getattr(e, "errno", None) in (65, 113):  # EHOSTUNREACH on macOS (65) and Linux (113)
+                return "denied (likely): System Settings > Privacy & Security > Local Network"
+            continue
+    return NC
+
+
+class _SameHost(urllib.request.HTTPRedirectHandler):
+    """Follow at most 3 redirects, and only back to the same gateway address."""
+    max_redirections = 3
+
+    def __init__(self, host):
+        self.host = host
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        import urllib.parse
+        if (urllib.parse.urlparse(newurl).hostname or "") != self.host:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def login_title(gw, opener=None):
+    """<title> of the gateway's own web page (one GET, no credentials, TLS unverified because routers self-sign)."""
+    import ssl
+    if not private_v4(gw):
+        return ""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    op = opener or urllib.request.build_opener(_SameHost(gw), urllib.request.HTTPSHandler(context=ctx))
+    for url in (f"https://{gw}/", f"http://{gw}/"):
+        try:
+            with op.open(urllib.request.Request(url, headers={"User-Agent": "netwatch-detect"}), timeout=4) as r:
+                body = r.read(65536).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            continue
+        m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+        if m:
+            return re.sub(r"[\x00-\x1f\x7f]+", " ", m.group(1)).strip()[:80]
+    return ""
+
+
+def upnp_gateway(gw, wait=2.0, search=None, describe=None):
+    """UPnP description of the default gateway (only an answer whose LOCATION is the gateway itself counts):
+    maker, model, and the external IP the router reports. Read-only; never changes mappings."""
+    import upnp_check as uc
+    import urllib.parse
+    if not private_v4(gw):
+        return {}
+    try:
+        locs = (search or uc.ssdp)(wait)
+    except OSError:
+        return {}
+    for loc in locs:
+        if (urllib.parse.urlparse(loc).hostname or "") != gw:
+            continue
+        try:
+            if describe:
+                return describe(loc)
+            import xml.etree.ElementTree as ET
+            root = uc.strip_ns(ET.fromstring(uc.fetch(loc)))
+            dev = root.find(".//device")
+            info = {"manufacturer": (dev.findtext("manufacturer") if dev is not None else "") or "",
+                    "model": (dev.findtext("modelName") if dev is not None else "") or "",
+                    "model_number": (dev.findtext("modelNumber") if dev is not None else "") or "",
+                    "friendly_name": (dev.findtext("friendlyName") if dev is not None else "") or ""}
+            url, stype = uc.control_url(loc)
+            if url:
+                try:
+                    info["external_ip"] = uc.soap(url, stype, "GetExternalIPAddress").get("NewExternalIPAddress", "")
+                except Exception:  # noqa: BLE001
+                    info["external_ip"] = ""
+            return {k: re.sub(r"[\x00-\x1f\x7f]+", " ", str(v)).strip()[:60] for k, v in info.items()}
+        except Exception:  # noqa: BLE001
+            continue
+    return {}
+
+
+def scan_host_check(d):
+    """Can the bot auto-pick this host (when it is the only connected desktop)? Strict: yes only when every safety
+    check ran and passed; a check that failed to run or is unknown is a no, so the owner is asked."""
+    why = []
+    gw = d.get("default_gateway", "")
+    if not gw or d.get("gateway_private") == NC:
+        why.append("gateway not checked")
+    elif not private_v4(gw):
+        why.append("gateway is not a private address")
+    for key, bad, label in (("vpn", "default route goes through a VPN", "VPN"),
+                            ("managed", "company-managed computer", "managed computer"),
+                            ("wsl", "WSL sees a virtual network", "WSL")):
+        v = d.get(key)
+        if v == "yes":
+            why.append(bad)
+        elif v != "no":
+            why.append(f"{label} check not checked")
+    if not d.get("lan_cidr"):
+        why.append("no LAN range found")
+    ln = str(d.get("local_network", ""))
+    if ln.startswith("denied"):
+        why.append("macOS Local Network access is off")
+    elif ln not in ("ok", "n/a"):
+        why.append("macOS Local Network check not checked")
+    return "yes" if not why else "no (" + "; ".join(why) + ")"
+
+
 def _quiet(cmd, timeout=10):
     try:
         rc, out = nw.run(cmd, timeout=timeout)
@@ -156,7 +511,7 @@ def relay_listeners(osf, ports=(8787, 5514)):
     return ", ".join(hits) or "none"
 
 
-def detect(osf):
+def detect(osf, probe=False):
     gw, iface = nw.default_gateway(osf)
     s = nw.suggest_scope(osf, gw_iface=(gw, iface))
     d = {"scan_host": socket.gethostname(), "os": osf, "release": os_release(), "python": platform.python_version(),
@@ -203,7 +558,60 @@ def detect(osf):
         keys = UNIFI_KEYS + ALERT_KEYS + [k for k in CONNECTOR_VARS if k not in UNIFI_KEYS + ALERT_KEYS and vals.get(k)]
         d["env_keys"] = {k: ("set" if vals.get(k) else "MISSING") for k in keys}
         vals = None  # values are never kept or printed
+    host_checks(d, osf, iface, probe)
     return d
+
+
+def _safe(fn, *a, **k):
+    try:
+        return fn(*a, **k)
+    except Exception:  # noqa: BLE001  a failed detection is reported as not checked, never as a pass
+        return NC
+
+
+def host_checks(d, osf, iface, probe):
+    """Scan host and network facts for the one confirm table. Local reads only; with probe (after scope consent)
+    also one SSDP search, one GET of the gateway's own page, and on macOS a connect to the gateway."""
+    gw = d.get("default_gateway", "")
+    d["gateway_private"] = "yes" if private_v4(gw) else ("no" if gw else NC)
+    d["wsl"] = _safe(lambda: "yes" if osf == "linux" and nw.is_wsl() else "no")
+    d["vpn"] = _safe(vpn_route, iface, default_route_desc(osf) if osf == "windows" else "")
+    d["managed"] = _safe(managed_machine, osf)
+    d["admin_rights"] = _safe(admin_rights, osf)
+    d["battery"] = _safe(battery_state, osf)
+    d["sleep_on_ac"] = _safe(sleep_state, osf)
+    d["python_store_stub"] = _safe(store_python_stub, osf)
+    d["host_firewall"] = _safe(host_firewall, osf)
+    d["network_profile"] = _safe(network_profile, osf)
+    d["ipv6"] = _safe(ipv6_state)
+    d["isp_router"] = isp_guess(d.get("gateway_vendor", "")) if d.get("vendor_source") in ("nmap-mac-prefixes", "builtin") else NC
+    d["brand"], d["brand_source"] = (d["gear_guess"], "oui") if d.get("gear_guess") else (NC, NC)
+    d["local_network"], d["upnp_model"], d["wan_ip_source"], d["wan_type"], d["login_title"] = (
+        "n/a" if osf != "macos" else NC), NC, NC, NC, NC
+    if probe and d["gateway_private"] == "yes":
+        d["local_network"] = _safe(local_network_state, osf, gw)
+        up = _safe(upnp_gateway, gw)
+        up = up if isinstance(up, dict) else {}
+        title = "" if d.get("gear_guess") else (_safe(login_title, gw) or "")
+        title = title if title != NC else ""
+        brand, src = router_brand(d.get("gateway_vendor", ""), up, title)
+        if brand:
+            d["brand"], d["brand_source"] = brand, src
+        d["upnp_model"] = " ".join(x for x in (up.get("manufacturer"), up.get("model")) if x) or ("no answer" if not up else NC)
+        d["login_title"] = title or NC
+        if up.get("external_ip"):
+            d["wan_ip_source"] = "upnp (is_default_gateway=yes)"
+            d["wan_type"] = classify_wan(up["external_ip"])
+        if d["isp_router"] != "yes" and (ISP_MAKERS.search(d["upnp_model"]) or ISP_MAKERS.search(title)):
+            d["isp_router"] = "yes"
+    elif probe:
+        d["local_network"] = NC if osf == "macos" else "n/a"
+    d["scan_host_ok"] = scan_host_check(d)
+
+
+HOST_CHECK_KEYS = ("scan_host_ok", "gateway_private", "vpn", "managed", "wsl", "admin_rights", "battery", "sleep_on_ac",
+                   "python_store_stub", "host_firewall", "network_profile", "ipv6", "local_network", "brand", "brand_source",
+                   "upnp_model", "login_title", "isp_router", "wan_ip_source", "wan_type")
 
 
 def print_detect(d, as_json=False):
@@ -221,6 +629,10 @@ def print_detect(d, as_json=False):
     for k in ("linger", "ufw", "relay_service", "relay_port_listeners"):
         if k in d:
             print(f"{k}={d[k]}")
+    print("== host and network checks (not checked = detection failed or skipped; never read as fine)")
+    for k in HOST_CHECK_KEYS:
+        if k in d:
+            print(f"{k}={d[k] if d[k] not in (None, '') else NC}")
     print("== env file (set or MISSING only, never values)")
     print(f"env_file={d['env_file']} state={d['env_state']}")
     for k, v in d["env_keys"].items():
@@ -267,7 +679,7 @@ def env_template(osf, gear=None, alerts=True):
     return "\n".join(lines) + "\n"
 
 
-USAGE = "usage: preflight.py [--suggest-scope | --detect [--json] | --env-template [--gear unifi|none] [--no-alerts] | --drift [--bin DIR] [--manifest FILE] | --health | --mark-routine NAME | --release-check --repo OWNER/NAME [--api URL] [--installed V]]"
+USAGE = "usage: preflight.py [--suggest-scope | --detect [--probe] [--json] | --env-template [--gear unifi|none] [--no-alerts] | --drift [--bin DIR] [--manifest FILE] | --health | --mark-routine NAME | --release-check --repo OWNER/NAME [--api URL] [--installed V]]"
 
 
 MANIFEST = "MANIFEST.sha256"
@@ -545,10 +957,11 @@ def main(argv=None):
         print_suggestion(osf)
         return 0
     if argv and argv[0] == "--detect":
-        if argv[1:] not in ([], ["--json"]):
+        rest = argv[1:]
+        if len(set(rest)) != len(rest) or any(x not in ("--json", "--probe") for x in rest):
             print(USAGE, file=sys.stderr)
             return 2
-        return print_detect(detect(osf), as_json=argv[1:] == ["--json"])
+        return print_detect(detect(osf, probe="--probe" in rest), as_json="--json" in rest)
     if argv and argv[0] == "--env-template":
         gear, alerts, rest = None, True, argv[1:]
         while rest:

@@ -7,7 +7,12 @@ Sends one SSDP M-SEARCH for Internet Gateway Devices on the LAN, then for each
 in-scope gateway reads its external IP and lists every port mapping
 (GetGenericPortMappingEntry). Never adds or deletes mappings. Responses whose
 LOCATION points outside scope.txt are ignored. --location skips SSDP.
+Each answering gateway is saved to NETWATCH_HOME/upnp/latest.json (gateway, is_default_gateway, external_ip,
+checked_at); the box-side wan_probe.py --upnp-file accepts it only when is_default_gateway is yes and it is
+under an hour old.
 """
+import json
+import time
 import argparse
 import ipaddress
 import os
@@ -90,6 +95,30 @@ def soap(url, stype, action, args=""):
     return {c.tag: (c.text or "") for c in resp} if resp is not None else {}
 
 
+def save_latest(gateway, is_default, external_ip, now=None):
+    """Record what the router reported, for the WAN probe gate. A non-default gateway never overwrites a default one."""
+    d = os.path.join(nw.netwatch_home(), "upnp")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    path = os.path.join(d, "latest.json")
+    try:
+        ipaddress.ip_address(external_ip)
+    except ValueError:
+        external_ip = ""
+    now = time.time() if now is None else now
+    rec = {"gateway": gateway, "is_default_gateway": is_default, "external_ip": external_ip, "checked_at": int(now),
+           "checked_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))}
+    if is_default != "yes" and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                old = json.load(fh)
+            if old.get("is_default_gateway") == "yes" and now - old.get("checked_at", 0) < 3600:
+                return path
+        except (OSError, ValueError):
+            pass
+    nw.write_private(path, json.dumps(rec, indent=2) + "\n")
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--location", default="")
@@ -123,12 +152,15 @@ def main():
         if not url:
             print(f"INFO {host}: no WAN connection service")
             continue
-        print(f"UPNP-ENABLED gateway={host} is_default_gateway={'yes' if host == default_gw else 'no'}")
+        isdef = "yes" if host == default_gw else "no"
+        print(f"UPNP-ENABLED gateway={host} is_default_gateway={isdef}")
+        ext = ""
         try:
             ext = soap(url, stype, "GetExternalIPAddress").get("NewExternalIPAddress", "")
             print(f"external_ip={ext or 'unknown'} (as reported by the router)")
         except Exception:  # noqa: BLE001
             print("external_ip=unknown")
+        save_latest(host, isdef, ext)
         n = 0
         for i in range(MAX_ENTRIES):
             try:

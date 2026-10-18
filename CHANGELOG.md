@@ -2,6 +2,17 @@
 
 Every release is a new tag with its own release file and SHA-256. Tags and files are never reused or replaced.
 
+## v1.3.0
+
+Release file `netwatch-helpers-v1.3.0.tar.gz`, SHA-256 `edf13a4dff2d63dd68b9576174851ce6b2b172f4f1aa4e0b4c844e0493d152e0`.
+
+- `preflight.py --detect` adds a host and network checks section: scan host fitness (`scan_host_ok`: the only connected desktop is picked without asking only when every safety check ran and passed; a check that could not run means the owner is asked), private gateway, VPN route, company-managed computer, WSL, admin rights, battery and sleep on mains power, Windows Store Python stub, host firewall, Windows network profile, IPv6, and the router brand with its source. Any check that fails prints `not checked`, never a pass.
+- `preflight.py --detect --probe` (after consent, private gateway only): the gateway's UPnP description and reported external address (CGNAT and double NAT shown as `wan_type`), its login page title, and the macOS Local Network permission check. Read-only.
+- `upnp_check.py` saves `upnp/latest.json`; `wan_probe.py --upnp-file` probes only when that record is from the default gateway, under an hour old, and names the same address.
+- `inventory.py accept --provisional` keeps a first baseline open for 24 hours and marks unnamed devices unreviewed; `inventory.py status` shows the window; a plain accept makes it final.
+- `alertd.py status` names why UniFi posts were refused (missing, scheme, mismatch) and says when the alert routine can be created (`create_routine=ready` after `leg_webhook` is proven). New `alertd.py token copy` puts the inbound token on the clipboard in the owner's own terminal without printing it.
+- Onboarding: plainer consent wording with guest networks left out, one setup block at a time with time labels, the download card only when the helpers are missing, the routine created after the first real test alert, and one quiet daily check card instead of two report cards. Template smaller.
+
 ## v1.2.0
 
 Release file `netwatch-helpers-v1.2.0.tar.gz`, SHA-256 `2a312190a976a763b7021d5e4b8500d429e10a4bcba41d13dabe7de5425e3b80`.

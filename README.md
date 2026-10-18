@@ -11,27 +11,27 @@ Helper scripts and guides for Net Watch, a Grok Bot agent that observes and secu
 
 ## Verify the release file yourself
 
-Current release: `netwatch-helpers-v1.2.0.tar.gz`, SHA-256 `2a312190a976a763b7021d5e4b8500d429e10a4bcba41d13dabe7de5425e3b80`.
+Current release: `netwatch-helpers-v1.3.0.tar.gz`, SHA-256 `edf13a4dff2d63dd68b9576174851ce6b2b172f4f1aa4e0b4c844e0493d152e0`.
 
 Linux:
 
 ```bash
-sha256sum netwatch-helpers-v1.2.0.tar.gz
+sha256sum netwatch-helpers-v1.3.0.tar.gz
 ```
 
 macOS:
 
 ```bash
-shasum -a 256 netwatch-helpers-v1.2.0.tar.gz
+shasum -a 256 netwatch-helpers-v1.3.0.tar.gz
 ```
 
 Windows (PowerShell):
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\netwatch-helpers-v1.2.0.tar.gz
+Get-FileHash -Algorithm SHA256 .\netwatch-helpers-v1.3.0.tar.gz
 ```
 
-The output must equal the hash above and the `BUNDLE_SHA256` line in the netwatch-setup skill. To check that an exported or shared template still pins this file, run `python3 tools/check_export.py EXPORTED_TEMPLATE --expect-sha256 2a312190a976a763b7021d5e4b8500d429e10a4bcba41d13dabe7de5425e3b80`.
+The output must equal the hash above and the `BUNDLE_SHA256` line in the netwatch-setup skill. To check that an exported or shared template still pins this file, run `python3 tools/check_export.py EXPORTED_TEMPLATE --expect-sha256 edf13a4dff2d63dd68b9576174851ce6b2b172f4f1aa4e0b4c844e0493d152e0`.
 
 ## Contents
 
@@ -45,9 +45,9 @@ The output must equal the hash above and the `BUNDLE_SHA256` line in the netwatc
 Recreate and check the current file:
 
 ```bash
-base64 -d dist/netwatch-helpers-v1.2.0.tar.gz.b64 > netwatch-helpers-v1.2.0.tar.gz
+base64 -d dist/netwatch-helpers-v1.3.0.tar.gz.b64 > netwatch-helpers-v1.3.0.tar.gz
 sha256sum -c SHA256SUMS --ignore-missing
-python3 build_bundle.py --out /tmp/rebuild && cmp /tmp/rebuild/netwatch-helpers-v1.2.0.tar.gz netwatch-helpers-v1.2.0.tar.gz
+python3 build_bundle.py --out /tmp/rebuild && cmp /tmp/rebuild/netwatch-helpers-v1.3.0.tar.gz netwatch-helpers-v1.3.0.tar.gz
 ```
 
 The rebuild matches when the local zlib produces the same deflate stream (zlib 1.3.1 was used); the base64 copy is exact regardless.
@@ -58,7 +58,7 @@ The agent runs a weekly read-only release check and asks the owner before any up
 
 ## Releases
 
-See CHANGELOG.md. Earlier files: v1.1.0 SHA-256 `3c1ac9a3f90a3a643def5794b52e34614c171dc89b0151029ae9aab97390e6d6`, v1.0.0 SHA-256 `5db7c8abc78532bf7a1586829ef2e511c2a86e8ec61874ba040bd6a3a8e73390`.
+See CHANGELOG.md. Earlier files: v1.2.0 SHA-256 `2a312190a976a763b7021d5e4b8500d429e10a4bcba41d13dabe7de5425e3b80`, v1.1.0 SHA-256 `3c1ac9a3f90a3a643def5794b52e34614c171dc89b0151029ae9aab97390e6d6`, v1.0.0 SHA-256 `5db7c8abc78532bf7a1586829ef2e511c2a86e8ec61874ba040bd6a3a8e73390`.
 
 ## Safety
 

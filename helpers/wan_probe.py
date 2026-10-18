@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Net Watch external exposure probe. Run from OUTSIDE the home network (the box).
 
-  wan_probe.py --ip WAN_IP --confirmed-by-router
+  wan_probe.py --ip WAN_IP --confirmed-by-router     WAN IP read from the router's connector this session
+  wan_probe.py --ip WAN_IP --upnp-file latest.json   WAN IP from upnp_check.py on the scan host: refused unless
+                                                     is_default_gateway=yes, external_ip equals --ip, and the
+                                                     record is under an hour old
 
 Plain TCP connect to a short list of commonly exposed ports. No payloads, no
 login attempts, no service fingerprinting. Only ever point it at the WAN
@@ -9,6 +12,8 @@ address the owner's own router reported in this session.
 """
 import argparse
 import ipaddress
+import json
+import time
 import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -32,14 +37,37 @@ def probe(ip, port, timeout):
         return port, "closed"
 
 
+def upnp_gate(path, ip, now=None, max_age=3600):
+    """Empty string when the UPnP record allows probing ip; otherwise the reason."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return "UPnP record unreadable"
+    if not isinstance(rec, dict) or rec.get("is_default_gateway") != "yes":
+        return "the UPnP answer did not come from this host's default gateway (is_default_gateway is not yes)"
+    if str(rec.get("external_ip", "")).strip() != ip.strip():
+        return "--ip does not match the external_ip the router reported"
+    age = (time.time() if now is None else now) - (rec.get("checked_at") or 0)
+    if not isinstance(rec.get("checked_at"), int) or age > max_age or age < -300:
+        return "UPnP record is older than an hour; run upnp_check.py again"
+    return ""
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ip", required=True)
     p.add_argument("--confirmed-by-router", action="store_true",
                    help="required: the owner's router reported this WAN IP this session")
+    p.add_argument("--upnp-file", default="", help="upnp/latest.json copied from the scan host")
     p.add_argument("--timeout", type=float, default=2.0)
     a = p.parse_args()
-    if not a.confirmed_by_router:
+    if a.upnp_file:
+        why = upnp_gate(a.upnp_file, a.ip)
+        if why:
+            print("REFUSED: " + why)
+            return 2
+    elif not a.confirmed_by_router:
         print("REFUSED: confirm the WAN IP from the owner's router first")
         return 2
     try:

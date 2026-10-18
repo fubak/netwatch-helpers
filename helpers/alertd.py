@@ -20,6 +20,8 @@ webhook: deduplicated, rate limited, low severity kept local, everything sanitiz
                                         change.py id and marks it applied. Ignore never hides critical events or inbound
                                         threats that were not blocked; always-page raises a match to at least high
   alertd.py service                     per-OS user-service instructions for the owner (prints, installs nothing)
+  alertd.py token copy                  owner only, in their own terminal: put ALERT_INBOUND_TOKEN on the clipboard
+                                        for the Alarm Manager webhook (never printed; refused when not interactive)
 
 Secrets (owner's env file only): ALERT_INBOUND_TOKEN (what UniFi sends), ROUTINE_WEBHOOK_URL,
 ROUTINE_WEBHOOK_KEY (the routine's sender key). Optional ALERT_SOURCES (comma-separated IPs
@@ -900,11 +902,24 @@ class RateLimiter:
 
 
 def token_ok(headers, token):
+    return token_problem(headers, token) == ""
+
+
+def token_problem(headers, token):
+    """'' when the token matches; else missing (no token sent), scheme (Authorization without Bearer), or mismatch.
+    Nothing about the token values is kept or printed."""
     if not token:
-        return False
-    got = headers.get("Authorization", "")
-    got = got[7:].strip() if got.lower().startswith("bearer ") else headers.get("X-Netwatch-Token", "").strip()
-    return bool(got) and hmac.compare_digest(got.encode(), token.encode())
+        return "mismatch"
+    auth = headers.get("Authorization", "") or ""
+    if auth.lower().startswith("bearer "):
+        got = auth[7:].strip()
+    else:
+        got = (headers.get("X-Netwatch-Token", "") or "").strip()
+        if not got:
+            return "scheme" if auth.strip() else "missing"
+    if not got:
+        return "missing"
+    return "" if hmac.compare_digest(got.encode(), token.encode()) else "mismatch"
 
 
 def make_handler(relay, token, allowed, limiter):
@@ -940,7 +955,9 @@ def make_handler(relay, token, allowed, limiter):
             if n is None or n > MAX_BODY:
                 relay.unauthorized(ip, "size")
                 return self.reply(413)
-            if not token_ok(self.headers, token):
+            why = token_problem(self.headers, token)
+            if why:
+                relay.bump(f"refused_token_{why}")
                 relay.unauthorized(ip, "token", trusted=bool(allowed) and ip in allowed)
                 return self.reply(401)
             try:
@@ -1096,6 +1113,16 @@ def cmd_status(_a):
         print(f"leg_{leg}={state} last_seen={(rec or {}).get('last') or 'never'} count={(rec or {}).get('count', 0)}{extra}"
               + (f" problem=\"{probs[leg]}\"" if leg in probs else ""))
     print(f"refused_24h={r.refused_24h(t)} refused_trusted_24h={sum(1 for x in r.refused_log if isinstance(x, list) and t - x[0] < 86400 and x[2])}")
+    tk = {k: r.counters.get(f"refused_token_{k}", 0) for k in ("missing", "scheme", "mismatch")}
+    if any(tk.values()):
+        hint = {"missing": "UniFi sent no token: turn on Bearer authentication in the Alarm Manager webhook",
+                "scheme": "token sent without the Bearer scheme: pick Bearer authentication",
+                "mismatch": "token differs from ALERT_INBOUND_TOKEN: copy it again with alertd.py token copy"}
+        top = max(tk, key=tk.get)
+        print(f"token_refusals missing={tk['missing']} scheme={tk['scheme']} mismatch={tk['mismatch']} hint=\"{hint[top]}\"")
+    proven = isinstance(r.legs.get("webhook"), dict) and "webhook" not in probs
+    print("create_routine=" + ("ready (leg_webhook proven)" if proven else
+                               "wait (press Test on the Alarm Manager alarm until leg_webhook=proven)"))
     if r.last_forward:
         print("last_forward " + " ".join(f"{k}={v}" for k, v in r.last_forward.items()))
     return 0
@@ -1233,6 +1260,45 @@ def service_sources():
     except Exception:  # missing or unreadable env file: fall back to the gateway
         vals = {}
     return sorted(allowed_sources(vals or {}, osf))
+
+
+CLIPBOARD = {"macos": [["pbcopy"]], "windows": [["clip"]],
+             "linux": [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]}
+
+
+def cmd_token(a):
+    """The owner copies ALERT_INBOUND_TOKEN to the clipboard in their own terminal (for UniFi Alarm Manager),
+    so it is never retyped or shown. Refused when not run interactively, so the bot cannot read it out."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("REFUSED: run this yourself in a terminal on the scan host; the token is never printed")
+        return 3
+    osf, vals, probs = env_vals()
+    tok = (vals.get("ALERT_INBOUND_TOKEN") or "").strip()
+    vals = None
+    if len(tok) < 24 or tok.startswith("PUT_"):
+        print("REFUSED: ALERT_INBOUND_TOKEN missing or shorter than 24 characters in the env file")
+        return 3
+    for cmd in CLIPBOARD.get(osf, []):
+        if not shutil_which(cmd[0]):
+            continue
+        try:
+            r = subprocess.run(cmd, input=tok, text=True, capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0:
+            tok = ""
+            print(f"copied ALERT_INBOUND_TOKEN to the clipboard with {cmd[0]}; paste it into the Alarm Manager Bearer token field, "
+                  "then copy something else to clear it")
+            return 0
+    tok = ""
+    print("REFUSED: no clipboard tool found (" + ", ".join(c[0] for c in CLIPBOARD.get(osf, [])) +
+          "); open the env file in your editor and copy the value from there")
+    return 3
+
+
+def shutil_which(name):
+    import shutil
+    return shutil.which(name)
 
 
 def feedback_path():
@@ -1379,8 +1445,10 @@ def main(argv=None):
     p = sub.add_parser("owner")
     p.add_argument("action", choices=["add-admin", "add-device", "remove", "list"])
     p.add_argument("value", nargs="?", default="")
+    p = sub.add_parser("token")
+    p.add_argument("action", choices=["copy"])
     a = ap.parse_args(argv)
-    return {"feedback": cmd_feedback, "owner": cmd_owner, "serve": cmd_serve, "status": cmd_status, "verify": cmd_verify, "ingest": cmd_ingest,
+    return {"token": cmd_token, "feedback": cmd_feedback, "owner": cmd_owner, "serve": cmd_serve, "status": cmd_status, "verify": cmd_verify, "ingest": cmd_ingest,
             "test": cmd_test, "service": cmd_service}[a.cmd](a)
 
 

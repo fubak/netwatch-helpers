@@ -4,7 +4,7 @@ When to use: Creating the live alert routine (name, trigger, prompt to save verb
 # Alert routine (create once)
 
 
-Created only after the owner's yes (onboarding Step 2 "Yes, set up alerts", or the owner asking). First look for a routine with this exact name and reuse it; never create a second one.
+Created only after the owner's yes (onboarding Step 2 "Yes, set up alerts", or the owner asking) and only once `alertd.py status` shows `create_routine=ready` (leg_webhook proven; onboarding Step 5). First look for a routine with this exact name and reuse it; never create a second one.
 
 - Name: `Net Watch: UDM live alerts`
 - Trigger: webhook (`{ "type": "webhook" }`). After saving, the routine panel shows the webhook URL and its sender key; the owner copies both into the scan host env file as `ROUTINE_WEBHOOK_URL` and `ROUTINE_WEBHOOK_KEY` (never in chat). The platform rejects posts without the key before the routine runs; the relay sends it as `Authorization: Bearer KEY` with no trailing newline.

@@ -4,7 +4,13 @@
 Works on Linux, macOS, and Windows (pure Python 3 standard library).
   inventory.py build SCAN_DIR    merge neighbor/arp-scan/nmap/ping output into SCAN_DIR/inventory.json
   inventory.py diff SCAN_DIR     compare SCAN_DIR/inventory.json with $NETWATCH_HOME/baseline.json
-  inventory.py accept SCAN_DIR   make this scan the new baseline (keeps existing labels)
+  inventory.py accept SCAN_DIR [--provisional]
+                                 make this scan the new baseline (keeps existing labels). --provisional
+                                 (first setup): the baseline stays provisional for 24 hours, unnamed
+                                 devices are marked unreviewed, devices that wake up in that window join
+                                 it on the next accept --provisional, and diff reports them as
+                                 NEW-PROVISIONAL instead of NEW. A plain accept makes it final.
+  inventory.py status            baseline state: none, provisional (until when) or final; unreviewed count
   inventory.py label MAC TEXT    set a friendly label on a baseline entry
   inventory.py forget MAC        remove a device the owner says is gone
   inventory.py summary SCAN_DIR [--json] [--no-controller] [--site NAME]
@@ -183,50 +189,98 @@ def load(path):
         return json.load(fh)
 
 
+PROVISIONAL_H = 24
+
+
+def provisional_until(base, now=None):
+    """Epoch until which the baseline is provisional, or 0 when it is final."""
+    u = base.get("provisional_until") if isinstance(base, dict) else None
+    if not isinstance(u, (int, float)):
+        return 0
+    now = dt.datetime.now().timestamp() if now is None else now
+    return u if now < u else 0
+
+
 def diff(scan_dir):
     cur = load(os.path.join(scan_dir, "inventory.json"))["hosts"]
     bpath = os.path.join(home(), "baseline.json")
     if not os.path.isfile(bpath):
         print("NO-BASELINE: review this scan with the owner, then run accept")
         return 0
-    base = load(bpath)["hosts"]
+    bdoc = load(bpath)
+    base = bdoc["hosts"]
+    prov = provisional_until(bdoc)
     new = [k for k in cur if k not in base]
     gone = [k for k in base if k not in cur]
     moved = [k for k in cur if k in base and sorted(cur[k]["ips"]) != sorted(base[k]["ips"])]
     for k in new:
         h = cur[k]
         flag = " randomized-MAC" if h.get("randomized_mac") else ""
-        print(f"NEW\t{','.join(h['ips'])}\t{h['mac']}\t{h['vendor'] or '?'}\t{h['hostname']}{flag}")
+        tag = "NEW-PROVISIONAL" if prov else "NEW"
+        print(f"{tag}\t{','.join(h['ips'])}\t{h['mac']}\t{h['vendor'] or '?'}\t{h['hostname']}{flag}")
     for k in gone:
         b = base[k]
         print(f"MISSING\t{','.join(b['ips'])}\t{b['mac']}\t{b.get('label', '')}\tlast_seen={b.get('last_seen', '?')}")
     for k in moved:
         print(f"IP-CHANGED\t{k}\t{','.join(base[k]['ips'])} -> {','.join(cur[k]['ips'])}\t{base[k].get('label', '')}")
-    print(f"summary new={len(new)} missing={len(gone)} ip_changed={len(moved)}")
+    unrev = sum(1 for h in base.values() if h.get("unreviewed"))
+    extra = f" baseline=provisional until {_iso(prov)}" if prov else ""
+    print(f"summary new={len(new)} missing={len(gone)} ip_changed={len(moved)} unreviewed={unrev}{extra}")
     return 0
 
 
-def accept(scan_dir):
+def _iso(epoch):
+    return dt.datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="minutes")
+
+
+def status():
+    bpath = os.path.join(home(), "baseline.json")
+    if not os.path.isfile(bpath):
+        print("baseline=none")
+        return 0
+    b = load(bpath)
+    prov = provisional_until(b)
+    hosts = b.get("hosts", {})
+    unrev = sum(1 for h in hosts.values() if h.get("unreviewed"))
+    print(f"baseline={'provisional until ' + _iso(prov) if prov else 'final'} hosts={len(hosts)} unreviewed={unrev}")
+    if not prov and b.get("provisional_until"):
+        print("note: the 24 hour provisional window is over; show the owner the unreviewed devices, then run accept to make it final")
+    return 0
+
+
+def accept(scan_dir, provisional=False, now=None):
     """Merge the scan into the baseline. Devices not seen this time are kept."""
     cur = load(os.path.join(scan_dir, "inventory.json"))
-    stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    now = dt.datetime.now().timestamp() if now is None else now
+    stamp = dt.datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds")
     bpath = os.path.join(home(), "baseline.json")
     base = {"hosts": {}}
     if os.path.isfile(bpath):
         base = load(bpath)
         shutil.copy2(bpath, bpath + ".prev")
     hosts = base.setdefault("hosts", {})
+    was_prov = provisional_until(base, now)
     for k, h in cur["hosts"].items():
         old = hosts.get(k, {})
         h["label"] = old.get("label", h.get("label", ""))
         h["first_seen"] = old.get("first_seen", stamp)
         h["last_seen"] = stamp
+        if provisional and not h["label"] and not h.get("hostname"):
+            h["unreviewed"] = True
+        elif old.get("unreviewed") and not h["label"]:
+            h["unreviewed"] = True
         hosts[k] = h
+    if provisional:
+        base["provisional_until"] = was_prov or int(now + PROVISIONAL_H * 3600)
+    else:
+        base.pop("provisional_until", None)
     base["updated"] = stamp
     base["last_scan_dir"] = scan_dir
     with open(bpath, "w", encoding="utf-8") as fh:
         json.dump(base, fh, indent=2)
-    print(f"baseline merged ({len(cur['hosts'])} seen, {len(hosts)} total); previous kept as baseline.json.prev")
+    unrev = sum(1 for h in hosts.values() if h.get("unreviewed"))
+    state = f"provisional until {_iso(base['provisional_until'])}" if provisional else "final"
+    print(f"baseline merged ({len(cur['hosts'])} seen, {len(hosts)} total, {unrev} unreviewed, {state}); previous kept as baseline.json.prev")
     return 0
 
 
@@ -250,6 +304,7 @@ def label(mac, text):
         print(f"not in baseline: {mac}")
         return 1
     base["hosts"][key]["label"] = text
+    base["hosts"][key].pop("unreviewed", None)
     with open(bpath, "w", encoding="utf-8") as fh:
         json.dump(base, fh, indent=2)
     print(f"labeled {key}: {text}")
@@ -357,6 +412,8 @@ def summary(scan_dir, as_json=False, use_controller=True, site="default"):
 
 
 def main(argv):
+    if argv[1:] == ["status"]:
+        return status()
     if len(argv) < 3:
         print(__doc__)
         return 2
@@ -367,7 +424,10 @@ def main(argv):
     if cmd == "diff":
         return diff(argv[2])
     if cmd == "accept":
-        return accept(argv[2])
+        if argv[3:] not in ([], ["--provisional"]):
+            print(__doc__)
+            return 2
+        return accept(argv[2], provisional=argv[3:] == ["--provisional"])
     if cmd == "forget":
         return forget(argv[2])
     if cmd == "summary":
