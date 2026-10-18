@@ -2,9 +2,14 @@
 
 Helper scripts and guides for Net Watch, a Grok Bot agent that observes and secures a home network the owner owns or administers. Template copies of the agent carry only short skill text, so the helpers and the longer guides ship here as one pinned release file. The agent downloads it only after the owner says yes, checks the bundle SHA-256 written in its netwatch-setup skill, then checks every file against the SHA256SUMS inside the bundle (covered by that same hash), and refuses on any mismatch.
 
+## Get Net Watch
+
+- Grok Bot template: [Net Watch on Grok Bot](https://x.ai/bot/0vuunQUBFlb4SnStUCtLt)
+- Made by [@bradshannon on X](https://x.com/bradshannon)
+
 ## Quick start (for a new owner)
 
-1. Add the Net Watch template to your Grok Bot and say hello. It asks two plain questions first: do you own or administer this network, and does your household know it is being monitored. If your router belongs to your ISP or landlord, pick that option: Net Watch then checks only your own devices and never sweeps the subnet.
+1. Add the [Net Watch template](https://x.ai/bot/0vuunQUBFlb4SnStUCtLt) to your Grok Bot and say hello. It asks two plain questions first: do you own or administer this network, and does your household know it is being monitored. If your router belongs to your ISP or landlord, pick that option: Net Watch then checks only your own devices and never sweeps the subnet.
 2. Pick **Quick look** for one scan with results in about 5 minutes, or **Full setup** (5 steps, about 30 minutes).
 3. Connect one always-on computer as the scan host (Linux is tested; Windows and macOS are beta).
 4. When asked, say yes to download this release file. The agent verifies it before installing anything.
