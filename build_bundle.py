@@ -3,10 +3,12 @@
 
 Same inputs give the same bytes on any machine with the same zlib: files sorted by name, flat layout, USTAR format,
 mode 0644, uid and gid 0, empty owner names, fixed mtime, gzip header mtime 0 and no file name, level 9.
-The tarball holds every helper plus SHA256SUMS (per-file). dist/SHA256SUMS also lists the tarball itself.
+The tarball holds every helper (flat), every guide as docs/NAME.md, and SHA256SUMS (per-file, covered by the bundle hash).
+dist/SHA256SUMS also lists the tarball itself.
 
 Usage:
-  build_bundle.py [--src DIR] [--out DIR]   build (default src: the bundle's skills folder, every */*.py)
+  build_bundle.py [--src DIR] [--docs DIR] [--out DIR]   build (default: helpers/*.py and docs/*.md next to tools/,
+                                                        or in this folder's repo layout)
   build_bundle.py --update-skill            build, then rewrite the pins in skills/netwatch-setup/SKILL.md
   build_bundle.py --check                   exit 1 if dist/ or the skill pins differ from a fresh build (writes nothing)
 """
@@ -19,11 +21,11 @@ import re
 import sys
 import tarfile
 
-VERSION = "v1.0.0"
+VERSION = "v1.1.0"
 NAME = f"netwatch-helpers-{VERSION}.tar.gz"
 MTIME = 1792195200  # 2026-10-17T00:00:00Z
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = HERE if os.path.isdir(os.path.join(HERE, "helpers")) else os.path.dirname(HERE)  # repo layout or bot bundle
 SETUP = os.path.join(ROOT, "skills", "netwatch-setup", "SKILL.md")
 # Owner-specific markers (names, hostnames, ids) are kept out of this file: one regex per line in private-markers.txt next to
 # this script (never committed) and/or NW_PRIVATE_MARKERS="a|b". Any IPv4 literal outside GENERIC_IPS is refused as well.
@@ -38,15 +40,16 @@ def opt(k, d):
     return sys.argv[sys.argv.index(k) + 1] if k in sys.argv else d
 
 
-def sources(src):
-    pats = [os.path.join(src, "*", "*.py"), os.path.join(src, "*.py")]
-    files = sorted({p for pat in pats for p in glob.glob(pat)}, key=os.path.basename)
-    names = [os.path.basename(p) for p in files]
-    if len(names) != len(set(names)):
-        sys.exit("duplicate helper names: " + ", ".join(sorted({n for n in names if names.count(n) > 1})))
+def sources(src, docs):
+    files = {os.path.basename(p): open(p, "rb").read() for p in sorted(glob.glob(os.path.join(src, "*.py")))}
     if not files:
         sys.exit("no helpers found under " + src)
-    return {os.path.basename(p): open(p, "rb").read() for p in files}
+    for p in sorted(glob.glob(os.path.join(docs, "*.md"))):
+        files["docs/" + os.path.basename(p)] = open(p, "rb").read()
+    for n in files:
+        if not re.fullmatch(r"(docs/)?[a-z0-9_-]+\.(py|md)", n):
+            sys.exit("file name not allowed in the bundle: " + n)
+    return files
 
 
 def privacy(files):
@@ -78,19 +81,21 @@ def build(files):
 
 def pinned_skill(text, files, tgz):
     h = hashlib.sha256(tgz).hexdigest()
-    body = "".join(f'    "{n}": "{hashlib.sha256(b).hexdigest()}",\n' for n, b in sorted(files.items()))
+    kb = max(1, round(len(tgz) / 1024))
+    if 'BUNDLE_SHA256 = "' not in text or "Bundle SHA-256: `" not in text or "(about " not in text:
+        sys.exit("netwatch-setup lacks the bootstrap pins (BUNDLE_SHA256, Bundle SHA-256 line, size)")
     t = re.sub(r'BUNDLE_SHA256 = "[0-9a-f]*"', f'BUNDLE_SHA256 = "{h}"', text, count=1)
-    t, k = re.subn(r"FILES = \{\n.*?\}\n", lambda _m: "FILES = {\n" + body + "}\n", t, count=1, flags=re.S)
-    if not k or 'BUNDLE_SHA256 = "' not in t or "Bundle SHA-256: `" not in t:
-        sys.exit("netwatch-setup lacks the bootstrap pins (BUNDLE_SHA256, FILES, Bundle SHA-256 line)")
     t = re.sub(r"Bundle SHA-256: `[0-9a-f]*`", f"Bundle SHA-256: `{h}`", t, count=1)
+    t = re.sub(r"releases/download/v[0-9.]+/netwatch-helpers-v[0-9.]+\.tar\.gz", f"releases/download/{VERSION}/{NAME}", t)
+    t = re.sub(r"\.tar\.gz \(about [0-9]+ KB\)", f".tar.gz (about {kb} KB)", t, count=1)
     return t
 
 
 def main():
-    src = opt("--src", os.path.join(ROOT, "skills"))
+    src = opt("--src", os.path.join(ROOT, "helpers"))
+    docs = opt("--docs", os.path.join(ROOT, "docs"))
     out = opt("--out", os.path.join(ROOT, "dist"))
-    files = sources(src)
+    files = sources(src, docs)
     bad = privacy(files)
     if bad:
         sys.exit("refusing to bundle personal data:\n" + "\n".join(bad))
@@ -102,7 +107,7 @@ def main():
             stale.append(tp)
         if not os.path.isfile(sp) or open(sp, "rb").read() != sums:
             stale.append(sp)
-        if os.path.isfile(SETUP) and src == os.path.join(ROOT, "skills"):
+        if os.path.isfile(SETUP) and src == os.path.join(ROOT, "helpers") and docs == os.path.join(ROOT, "docs"):
             t = open(SETUP, encoding="utf-8").read()
             if pinned_skill(t, files, tgz) != t:
                 stale.append("netwatch-setup pins")
@@ -114,7 +119,7 @@ def main():
     if "--update-skill" in sys.argv:
         t = open(SETUP, encoding="utf-8").read()
         open(SETUP, "w", encoding="utf-8").write(pinned_skill(t, files, tgz))
-    print(f"BUILT {tp} {len(tgz)} bytes sha256 {hashlib.sha256(tgz).hexdigest()} ({len(files)} helpers)")
+    print(f"BUILT {tp} {len(tgz)} bytes sha256 {hashlib.sha256(tgz).hexdigest()} ({sum(n.endswith('.py') for n in files)} helpers, {sum(n.endswith('.md') for n in files)} guides)")
 
 
 if __name__ == "__main__":
