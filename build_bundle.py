@@ -21,7 +21,7 @@ import re
 import sys
 import tarfile
 
-VERSION = "v1.3.0"
+VERSION = "v1.3.1"
 NAME = f"netwatch-helpers-{VERSION}.tar.gz"
 MTIME = 1792195200  # 2026-10-17T00:00:00Z
 HERE = os.path.dirname(os.path.abspath(__file__))

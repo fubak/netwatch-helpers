@@ -11,32 +11,32 @@ Helper scripts and guides for Net Watch, a Grok Bot agent that observes and secu
 
 ## Verify the release file yourself
 
-Current release: `netwatch-helpers-v1.3.0.tar.gz`, SHA-256 `edf13a4dff2d63dd68b9576174851ce6b2b172f4f1aa4e0b4c844e0493d152e0`.
+Current release: `netwatch-helpers-v1.3.1.tar.gz`, SHA-256 `af27bc332de56c8a9704964575bc0a4a5b88f57480520a7d399a90e7713f31f1`.
 
 Linux:
 
 ```bash
-sha256sum netwatch-helpers-v1.3.0.tar.gz
+sha256sum netwatch-helpers-v1.3.1.tar.gz
 ```
 
 macOS:
 
 ```bash
-shasum -a 256 netwatch-helpers-v1.3.0.tar.gz
+shasum -a 256 netwatch-helpers-v1.3.1.tar.gz
 ```
 
 Windows (PowerShell):
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\netwatch-helpers-v1.3.0.tar.gz
+Get-FileHash -Algorithm SHA256 .\netwatch-helpers-v1.3.1.tar.gz
 ```
 
-The output must equal the hash above and the `BUNDLE_SHA256` line in the netwatch-setup skill. To check that an exported or shared template still pins this file, run `python3 tools/check_export.py EXPORTED_TEMPLATE --expect-sha256 edf13a4dff2d63dd68b9576174851ce6b2b172f4f1aa4e0b4c844e0493d152e0`.
+The output must equal the hash above and the `BUNDLE_SHA256` line in the netwatch-setup skill. To check that an exported or shared template still pins this file, run `python3 tools/check_export.py EXPORTED_TEMPLATE --expect-sha256 af27bc332de56c8a9704964575bc0a4a5b88f57480520a7d399a90e7713f31f1`.
 
 ## Contents
 
 - `helpers/`: 18 Python 3.8+ scripts, standard library only. 16 run on the owner's scan host (Linux, macOS beta, Windows beta); `vuln_lookup.py` and `wan_probe.py` run on the agent's box.
-- `docs/`: 33 guides (vendor connectors with pass/fail tests, local AI CLIs, audits, full references, the Windows and macOS test checklist). In the bundle they sit under `docs/`. Skills and the agent's hard rules win over a guide on any conflict.
+- `docs/`: 34 guides (vendor connectors with pass/fail tests, local AI CLIs, audits, full references, the Windows and macOS test checklist). In the bundle they sit under `docs/`. Skills and the agent's hard rules win over a guide on any conflict.
 - `build_bundle.py`: reproducible build (sorted, USTAR, mode 0644, uid and gid 0, fixed mtime, gzip mtime 0, level 9). It refuses unexpected file names, `__pycache__`, and files with non-generic IP literals.
 - `tools/check_export.py`: extracts the bootstrap from exported template text and checks its pins.
 - `SHA256SUMS`: per-file SHA-256 of every bundled file, plus the release file.
@@ -45,9 +45,9 @@ The output must equal the hash above and the `BUNDLE_SHA256` line in the netwatc
 Recreate and check the current file:
 
 ```bash
-base64 -d dist/netwatch-helpers-v1.3.0.tar.gz.b64 > netwatch-helpers-v1.3.0.tar.gz
+base64 -d dist/netwatch-helpers-v1.3.1.tar.gz.b64 > netwatch-helpers-v1.3.1.tar.gz
 sha256sum -c SHA256SUMS --ignore-missing
-python3 build_bundle.py --out /tmp/rebuild && cmp /tmp/rebuild/netwatch-helpers-v1.3.0.tar.gz netwatch-helpers-v1.3.0.tar.gz
+python3 build_bundle.py --out /tmp/rebuild && cmp /tmp/rebuild/netwatch-helpers-v1.3.1.tar.gz netwatch-helpers-v1.3.1.tar.gz
 ```
 
 The rebuild matches when the local zlib produces the same deflate stream (zlib 1.3.1 was used); the base64 copy is exact regardless.

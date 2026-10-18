@@ -2,6 +2,17 @@
 
 Every release is a new tag with its own release file and SHA-256. Tags and files are never reused or replaced.
 
+## v1.3.1
+
+Release file `netwatch-helpers-v1.3.1.tar.gz`, SHA-256 `af27bc332de56c8a9704964575bc0a4a5b88f57480520a7d399a90e7713f31f1`.
+
+- Own-devices-only scope (ISP or landlord router): `wan_probe.py --scope-file` refuses with a plain message, a UPnP record carrying `scope_mode=own-devices-only` is refused, `upnp_check.py` records the scope mode, and `preflight.py --detect --probe` no longer fetches the router's login page.
+- `preflight.py --health` adds an `overdue` line from routine marks (daily 36 hours, weekly 8 days, monthly 35 days, quarterly 100 days, alerts 8 days, read from the cadence word in the routine name such as nw-weekly).
+- New `alertd.py owner stats [--since 24h]`: how many trusted owner changes were journaled instead of paged, for the daily report, so a stolen admin session from a trusted device cannot stay silent.
+- Every routine records its run with `preflight.py --mark-routine NAME`; four schedule routines (nw-daily, nw-weekly, nw-monthly, nw-quarterly) are offered on one card at setup end. The full-subnet port scan and the KEV and NVD pass run weekly.
+- New guide netwatch-response-by-brand: what Net Watch can detect, propose, do with consent, and leave to the owner, for UniFi, pfSense and OPNsense, Omada, ASUS, eero, Firewalla, Synology, Pi-hole and AdGuard Home, and ISP routers.
+- Onboarding: Quick look is the default (no "How much now?" card) with full setup offered once after the first results; a declined command approval gets the manual run-and-paste path instead of a retry; the smart-home card only appears when a home-control bot is in the profile. The severity floor (change 20261018-074528-2bf7) is unchanged.
+
 ## v1.3.0
 
 Release file `netwatch-helpers-v1.3.0.tar.gz`, SHA-256 `edf13a4dff2d63dd68b9576174851ce6b2b172f4f1aa4e0b4c844e0493d152e0`.

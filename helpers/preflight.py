@@ -27,7 +27,9 @@ Installs nothing. Usage:
                                    exit 0 clean, 1 drift, 2 manifest missing or unreadable. Read-only.
   preflight.py --health            one GREEN/YELLOW/RED line each: connectors, relay legs, last routine run,
                                    disk, open changes, drift, TLS settings. Read-only; exit 1 if any RED.
-  preflight.py --mark-routine NAME record that routine NAME ran now (NETWATCH_HOME/state/routine-NAME.last)
+  preflight.py --mark-routine NAME record that routine NAME ran now (NETWATCH_HOME/state/routine-NAME.last);
+                                   --health flags it overdue by the cadence word in NAME (daily, weekly, monthly,
+                                   quarterly, alerts), for example nw-weekly
   preflight.py --release-check --repo OWNER/NAME [--api URL] [--installed vX.Y.Z]
                                    read-only: compare the installed helper version with the latest GitHub
                                    release. Prints the result only; never downloads, and never takes a
@@ -592,13 +594,14 @@ def host_checks(d, osf, iface, probe):
         d["local_network"] = _safe(local_network_state, osf, gw)
         up = _safe(upnp_gateway, gw)
         up = up if isinstance(up, dict) else {}
-        title = "" if d.get("gear_guess") else (_safe(login_title, gw) or "")
+        own_only = nw.scope_mode() == "own-devices-only"  # ISP or landlord router: never fetch its login page
+        title = "" if (d.get("gear_guess") or own_only) else (_safe(login_title, gw) or "")
         title = title if title != NC else ""
         brand, src = router_brand(d.get("gateway_vendor", ""), up, title)
         if brand:
             d["brand"], d["brand_source"] = brand, src
         d["upnp_model"] = " ".join(x for x in (up.get("manufacturer"), up.get("model")) if x) or ("no answer" if not up else NC)
-        d["login_title"] = title or NC
+        d["login_title"] = title or ("skipped (own-devices-only scope)" if own_only else NC)
         if up.get("external_ip"):
             d["wan_ip_source"] = "upnp (is_default_gateway=yes)"
             d["wan_type"] = classify_wan(up["external_ip"])
@@ -816,6 +819,17 @@ def _age_h(ts, now):
     return (now - ts) / 3600.0
 
 
+ROUTINE_LIMIT_H = {"daily": 36, "weekly": 8 * 24, "monthly": 35 * 24, "quarterly": 100 * 24, "alerts": 8 * 24}
+
+
+def routine_limit_h(name):
+    """Overdue limit in hours from the cadence word in a routine name (nw-weekly -> 8 days); None if unknown."""
+    for word, h in ROUTINE_LIMIT_H.items():
+        if word in name.split("-"):
+            return h
+    return None
+
+
 def health(home, osf, now=None):
     """[(name, LEVEL, detail)] with LEVEL in GREEN/YELLOW/RED. Reads only."""
     now = now or time.time()
@@ -877,6 +891,12 @@ def health(home, osf, now=None):
         t, name = max(marks)
         h = _age_h(t, now)
         out.append(("last_routine", "GREEN" if h < 8 * 24 else "YELLOW", f"{name} {h:.0f}h ago"))
+        late = []
+        for t2, n2 in sorted(marks, key=lambda m: m[1]):
+            lim = routine_limit_h(n2)
+            if lim and _age_h(t2, now) > lim:
+                late.append(f"{n2} {_age_h(t2, now) / 24:.0f}d ago")
+        out.append(("overdue", "YELLOW" if late else "GREEN", ("overdue: " + ", ".join(late)) if late else "every routine ran on time"))
     try:
         du = shutil.disk_usage(home if os.path.isdir(home) else os.path.expanduser("~"))
         free = du.free / du.total * 100 if du.total else 100

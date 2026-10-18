@@ -12,6 +12,7 @@ webhook: deduplicated, rate limited, low severity kept local, everything sanitiz
   alertd.py ingest FILE [--webhook]     dry run: classify syslog lines (or one webhook JSON) and show decisions
   alertd.py test [--severity high] [--send]   synthetic event; forwards only with --send
   alertd.py owner add-admin NAME | add-device MAC_OR_IP | remove NAME_MAC_OR_IP | list
+  alertd.py owner stats [--since 24h]    count owner-suppressed (journal-only) events in the window, for the quiet report
                                         owner identity (NETWATCH_HOME/owner.json): audit events by a listed admin
                                         from a listed LAN device are journaled as expected owner changes, not forwarded
   alertd.py feedback ignore-signature SID_OR_TEXT --change-id ID | always-page SID_OR_TEXT --change-id ID |
@@ -1359,7 +1360,64 @@ def owner_path():
     return os.path.join(nw.netwatch_home(), "owner.json")
 
 
+def parse_since(v):
+    """'24h', '7d', '90m' -> seconds; None when malformed."""
+    m = re.fullmatch(r"\s*([0-9]{1,4})\s*([mhd])\s*", v or "")
+    if not m or int(m.group(1)) == 0:
+        return None
+    return int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def owner_stats(d, since_s, now=None):
+    """(suppressed_events, folds) for owner changes journaled or still open in the last since_s seconds."""
+    now = time.time() if now is None else now
+    cut = now - since_s
+    events = folds = 0
+
+    def ts(v):
+        try:
+            return dt.datetime.fromisoformat(str(v)).timestamp()
+        except ValueError:
+            return None
+    for name in ("journal.1.jsonl", "journal.jsonl"):
+        try:
+            fh = open(os.path.join(d, name), encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict) or r.get("decision") != "journal-only (owner change)":
+                    continue
+                t = ts(r.get("last") or r.get("at"))
+                if t is not None and t >= cut:
+                    folds += 1
+                    events += int(r.get("folded") or 1)
+    try:
+        with open(os.path.join(d, "state.json"), encoding="utf-8") as fh:
+            f = (json.load(fh) or {}).get("owner_fold") or {}
+        if f and float(f.get("last_t", 0)) >= cut:
+            folds += 1
+            events += int(f.get("count") or 1)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return events, folds
+
+
 def cmd_owner(a):
+    if a.action == "stats":
+        sec = parse_since(a.since)
+        if sec is None:
+            print("REFUSED: --since takes a number and m, h, or d (for example 24h)")
+            return 2
+        ev, folds = owner_stats(adir(), sec)
+        print(f"owner_suppressed_events={ev} folds={folds} since={a.since.strip()}")
+        print("note: these were trusted owner admin changes from trusted owner devices; report the count every day, "
+              "and if the owner did not make them, treat it as a possible stolen admin session")
+        return 0
     path = owner_path()
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1443,8 +1501,9 @@ def main(argv=None):
     p.add_argument("value", nargs="?", default="")
     p.add_argument("--change-id", default="")
     p = sub.add_parser("owner")
-    p.add_argument("action", choices=["add-admin", "add-device", "remove", "list"])
+    p.add_argument("action", choices=["add-admin", "add-device", "remove", "list", "stats"])
     p.add_argument("value", nargs="?", default="")
+    p.add_argument("--since", default="24h")
     p = sub.add_parser("token")
     p.add_argument("action", choices=["copy"])
     a = ap.parse_args(argv)

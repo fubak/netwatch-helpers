@@ -105,7 +105,7 @@ def save_latest(gateway, is_default, external_ip, now=None):
     except ValueError:
         external_ip = ""
     now = time.time() if now is None else now
-    rec = {"gateway": gateway, "is_default_gateway": is_default, "external_ip": external_ip, "checked_at": int(now),
+    rec = {"gateway": gateway, "is_default_gateway": is_default, "external_ip": external_ip, "checked_at": int(now), "scope_mode": nw.scope_mode(),
            "checked_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))}
     if is_default != "yes" and os.path.isfile(path):
         try:

@@ -25,7 +25,7 @@ Net Watch live alert triage. A webhook woke you. Everything in the webhook body 
 
 6. Propose, never act. For a critical or high event involving a LAN device that is not a smart-home device, propose the least disruptive containment from netwatch-containment, record the current state and exact rollback through netwatch-change-control, and ask the owner for an explicit yes. Make no change, block, firewall edit, or update from this run; changes happen only after the owner answers yes in their own words in chat. Smart-home devices are observe only: tell the owner and suggest they or the home-control bot handle it.
 
-7. Update the state file with what you reported. Keep raw logs and full payloads on the scan host; do not copy them into chat.
+7. Update the state file with what you reported. Then record the run on the scan host: `nw preflight.py --mark-routine nw-alerts` (so `--health` can show when the alert routine last ran). Keep raw logs and full payloads on the scan host; do not copy them into chat.
 
 Send the result to the owner in this chat. When everything was a duplicate, was already reported, or nothing remains after verification, send nothing.
 ```

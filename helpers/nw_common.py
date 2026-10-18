@@ -65,7 +65,7 @@ class _SecretKey:
 
 
 SECRET_KEY = _SecretKey()
-NW_VERSION = "v1.3.0"  # helper bundle version; build_bundle.py refuses a bundle whose VERSION differs
+NW_VERSION = "v1.3.1"  # helper bundle version; build_bundle.py refuses a bundle whose VERSION differs
 OWN_DEVICES_MARKER = "# netwatch: own-devices-only"  # scope.txt line for ISP or landlord routers: single addresses only
 MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 

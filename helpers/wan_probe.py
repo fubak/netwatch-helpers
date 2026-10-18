@@ -6,6 +6,10 @@
                                                      is_default_gateway=yes, external_ip equals --ip, and the
                                                      record is under an hour old
 
+Own-devices-only scope (ISP or landlord router): refused. The WAN address and the router belong to the ISP
+or landlord, so Net Watch does not probe them. --scope-file (scope.txt copied from the scan host) or a UPnP
+record carrying scope_mode=own-devices-only triggers the refusal.
+
 Plain TCP connect to a short list of commonly exposed ports. No payloads, no
 login attempts, no service fingerprinting. Only ever point it at the WAN
 address the owner's own router reported in this session.
@@ -37,6 +41,21 @@ def probe(ip, port, timeout):
         return port, "closed"
 
 
+OWN_DEVICES_MARKER = "# netwatch: own-devices-only"
+OWN_DEVICES_REFUSAL = ("REFUSED: own-devices-only scope (ISP or landlord router). The internet address and the router "
+                       "belong to your ISP or landlord, so Net Watch does not probe them. Ask them about open ports, "
+                       "or switch to whole-network scope if you run the router.")
+
+
+def scope_file_own_only(path):
+    """True when the copied scope.txt carries the own-devices-only marker (unreadable counts as own-only)."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return any(l.strip().lower() == OWN_DEVICES_MARKER for l in fh)
+    except OSError:
+        return True
+
+
 def upnp_gate(path, ip, now=None, max_age=3600):
     """Empty string when the UPnP record allows probing ip; otherwise the reason."""
     try:
@@ -44,6 +63,8 @@ def upnp_gate(path, ip, now=None, max_age=3600):
             rec = json.load(fh)
     except (OSError, ValueError):
         return "UPnP record unreadable"
+    if isinstance(rec, dict) and rec.get("scope_mode") == "own-devices-only":
+        return OWN_DEVICES_REFUSAL[len("REFUSED: "):]
     if not isinstance(rec, dict) or rec.get("is_default_gateway") != "yes":
         return "the UPnP answer did not come from this host's default gateway (is_default_gateway is not yes)"
     if str(rec.get("external_ip", "")).strip() != ip.strip():
@@ -60,8 +81,12 @@ def main():
     p.add_argument("--confirmed-by-router", action="store_true",
                    help="required: the owner's router reported this WAN IP this session")
     p.add_argument("--upnp-file", default="", help="upnp/latest.json copied from the scan host")
+    p.add_argument("--scope-file", default="", help="scope.txt copied from the scan host (own-devices-only is refused)")
     p.add_argument("--timeout", type=float, default=2.0)
     a = p.parse_args()
+    if a.scope_file and scope_file_own_only(a.scope_file):
+        print(OWN_DEVICES_REFUSAL)
+        return 2
     if a.upnp_file:
         why = upnp_gate(a.upnp_file, a.ip)
         if why:
