@@ -28,3 +28,15 @@ Useful GETs (paths are under /api/v2, which the helper adds): `/status/interface
 ## Writes
 
 Block a host: add its IP to an alias used by an existing block rule, then apply. Record the alias contents before and the exact removal as rollback. All through netwatch-change-control, done by the owner in the UI (the helper is read-only for these brands).
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw nw_http.py opnsense GET /api/core/firmware/status --fields product_version
+nw nw_http.py pfsense GET /status/system --path data
+```
+
+- PASS: the line for the owner's firewall shows `HTTP 200` and a version or system object.
+- FAIL: `HTTP 401` or `HTTP 403` (key, secret, or API user rights), a TLS error (certificate settings), or exit 4. Give the owner one line, mark the connector untested, and continue setup.

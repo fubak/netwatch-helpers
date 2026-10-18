@@ -21,7 +21,7 @@ import re
 import sys
 import tarfile
 
-VERSION = "v1.1.0"
+VERSION = "v1.2.0"
 NAME = f"netwatch-helpers-{VERSION}.tar.gz"
 MTIME = 1792195200  # 2026-10-17T00:00:00Z
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +41,8 @@ def opt(k, d):
 
 
 def sources(src, docs):
-    files = {os.path.basename(p): open(p, "rb").read() for p in sorted(glob.glob(os.path.join(src, "*.py")))}
+    files = {os.path.basename(p): open(p, "rb").read() for p in sorted(glob.glob(os.path.join(src, "*.py")))
+             if os.path.isfile(p) and "__pycache__" not in p}  # never bundle caches (glob *.py skips folders and .pyc)
     if not files:
         sys.exit("no helpers found under " + src)
     for p in sorted(glob.glob(os.path.join(docs, "*.md"))):
@@ -96,6 +97,9 @@ def main():
     docs = opt("--docs", os.path.join(ROOT, "docs"))
     out = opt("--out", os.path.join(ROOT, "dist"))
     files = sources(src, docs)
+    m = re.search(rb'^NW_VERSION = "(v[0-9.]+)"', files.get("nw_common.py", b""), re.M)
+    if not m or m.group(1).decode() != VERSION:
+        sys.exit(f"nw_common.NW_VERSION must equal {VERSION} (the installed version the release checker compares)")
     bad = privacy(files)
     if bad:
         sys.exit("refusing to bundle personal data:\n" + "\n".join(bad))

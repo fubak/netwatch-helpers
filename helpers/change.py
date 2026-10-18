@@ -12,7 +12,13 @@ config edit) gets a record here BEFORE it runs, with a rollback step.
   change.py rolledback ID --result TEXT
   change.py failed ID --result TEXT
   change.py show ID
-  change.py list
+  change.py declined ID --quote "owner's exact declining words"
+  change.py expired ID [--result TEXT]   proposal never approved in time
+  change.py superseded ID --by OTHER_ID_OR_REASON
+  change.py expire            mark every proposal older than 30 minutes without approval as expired
+  change.py list [--open]     --open: only proposed or approved-not-applied (runs expire first)
+
+Closed statuses (declined, expired, superseded) are final: approve refuses them.
 """
 import argparse
 import datetime as dt
@@ -26,6 +32,9 @@ sys.path[:0] = [HERE, os.path.join(HERE, "..", "netwatch-setup")]
 import nw_common as nw  # noqa: E402
 
 APPROVAL_TTL_MIN = 30
+PROPOSAL_TTL_MIN = 30
+CLOSED = {"declined", "expired", "superseded"}
+OPEN = {"proposed", "approved", "executed"}
 
 
 def ledger_dir():
@@ -88,6 +97,8 @@ def stamp(rec, status, note):
 
 def cmd_approve(a):
     rec = load(a.id)
+    if rec["status"] in CLOSED:
+        sys.exit(f"refused: change is {rec['status']} and closed; propose a new change")
     if rec["status"] != "proposed":
         sys.exit(f"refused: status is {rec['status']}, expected proposed")
     if not a.quote.strip():
@@ -127,17 +138,78 @@ def cmd_result(a, status):
     print(f"{status} {a.id}")
 
 
+def cmd_declined(a):
+    rec = load(a.id)
+    if rec["status"] not in ("proposed", "approved"):
+        sys.exit(f"refused: cannot decline from status {rec['status']}")
+    if not a.quote.strip():
+        sys.exit("refused: --quote must hold the owner's exact declining words")
+    rec["declined_at"] = now().isoformat()
+    rec["decline_quote"] = a.quote
+    stamp(rec, "declined", "owner declined")
+    print(f"declined {a.id}")
+
+
+def cmd_expired(a):
+    rec = load(a.id)
+    if rec["status"] not in ("proposed", "approved"):
+        sys.exit(f"refused: cannot expire from status {rec['status']}")
+    stamp(rec, "expired", a.result or "expired by command")
+    print(f"expired {a.id}")
+
+
+def cmd_superseded(a):
+    rec = load(a.id)
+    if rec["status"] not in ("proposed", "approved"):
+        sys.exit(f"refused: cannot supersede from status {rec['status']}")
+    if not a.by.strip():
+        sys.exit("refused: --by needs the replacing change id or a reason")
+    rec["superseded_by"] = a.by
+    stamp(rec, "superseded", f"superseded by {a.by}")
+    print(f"superseded {a.id}")
+
+
+def all_records():
+    d = ledger_dir()
+    out = []
+    for name in sorted(os.listdir(d)):
+        if name.endswith(".json"):
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as fh:
+                    out.append(json.load(fh))
+            except (OSError, ValueError):
+                print(f"WARN unreadable record {name}", file=sys.stderr)
+    return out
+
+
+def auto_expire():
+    n = 0
+    for r in all_records():
+        if r.get("status") != "proposed":
+            continue
+        try:
+            age = now() - dt.datetime.fromisoformat(r["created"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if age > dt.timedelta(minutes=PROPOSAL_TTL_MIN):
+            r.setdefault("history", [])
+            stamp(r, "expired", f"auto: no approval within {PROPOSAL_TTL_MIN} minutes")
+            print(f"expired {r['id']}")
+            n += 1
+    return n
+
+
 def cmd_show(a):
     print(json.dumps(load(a.id), indent=2))
 
 
-def cmd_list(_a):
-    d = ledger_dir()
-    for name in sorted(os.listdir(d)):
-        if name.endswith(".json"):
-            with open(os.path.join(d, name), encoding="utf-8") as fh:
-                r = json.load(fh)
-            print(f"{r['id']}\t{r['status']}\t{r['target']}\t{r['action']}")
+def cmd_list(a):
+    if getattr(a, "open", False):
+        auto_expire()
+    for r in all_records():
+        if getattr(a, "open", False) and r.get("status") not in OPEN:
+            continue
+        print(f"{r['id']}\t{r['status']}\t{r.get('target', '')}\t{r.get('action', '')}")
 
 
 def main():
@@ -155,7 +227,18 @@ def main():
         s = sub.add_parser(name)
         s.add_argument("id")
         s.add_argument("--result", required=True)
-    sub.add_parser("list")
+    d = sub.add_parser("declined")
+    d.add_argument("id")
+    d.add_argument("--quote", required=True)
+    e = sub.add_parser("expired")
+    e.add_argument("id")
+    e.add_argument("--result", default="")
+    sp = sub.add_parser("superseded")
+    sp.add_argument("id")
+    sp.add_argument("--by", required=True)
+    sub.add_parser("expire")
+    ls = sub.add_parser("list")
+    ls.add_argument("--open", action="store_true")
     a = p.parse_args()
     if a.cmd == "new":
         cmd_new(a)
@@ -165,6 +248,14 @@ def main():
         return cmd_check(a)
     elif a.cmd in ("executed", "applied", "rolledback", "failed"):
         cmd_result(a, a.cmd)
+    elif a.cmd == "declined":
+        cmd_declined(a)
+    elif a.cmd == "expired":
+        cmd_expired(a)
+    elif a.cmd == "superseded":
+        cmd_superseded(a)
+    elif a.cmd == "expire":
+        print(f"expired {auto_expire()} stale proposal(s)")
     elif a.cmd == "show":
         cmd_show(a)
     else:

@@ -48,3 +48,15 @@ nw nw_http.py unifi-classic GET /api/s/default/stat/device --path data --fields 
 - Rollback: same with `--set cmd=unblock-sta` and a new approved change id.
 - The helper checks the change id is approved and fresh, marks it executed before sending (one approval = one call), and refuses writes without it.
 - Port forward, firewall, Wi-Fi, VLAN, and firmware changes: prefer the owner doing them in the UniFi app with exact steps; the bot verifies afterwards.
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw nw_http.py unifi-classic GET /api/self/sites --path data --fields name,desc
+nw nw_http.py unifi-version
+```
+
+- PASS: `HTTP 200`, at least one site, and the UniFi OS and Network versions print.
+- FAIL: `LOGIN-FAIL` (user or password, or the account is not local), `LOGIN-FAIL HTTP 429` or `RATE-LIMITED` (wait a few minutes, never loop), a TLS error (UNIFI_VERIFY_SSL), or exit 4. Give the owner one line, mark the connector untested, and continue setup.

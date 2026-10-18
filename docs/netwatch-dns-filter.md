@@ -33,3 +33,15 @@ nw nw_http.py adguard GET /filtering/status --fields enabled,filters
 ## Rules
 
 Read-only here. Blocking domains or clients, toggling protection, or DHCP changes go through netwatch-change-control and are done by the owner in the filter's UI.
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw nw_http.py pihole GET /info/version --path version
+nw nw_http.py adguard GET /status --fields version,protection_enabled
+```
+
+- PASS: the line for the owner's filter shows `HTTP 200` and a version; then `nw dns_check.py` shows the filter as the egress resolver.
+- FAIL: `HTTP 401` (password), a timeout (URL or port), or `dns_check.py` reporting an ISP or public egress resolver (bypass). Give the owner one line, mark the connector untested, and continue setup.

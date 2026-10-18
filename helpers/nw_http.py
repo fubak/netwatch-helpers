@@ -4,6 +4,12 @@
   nw_http.py CONNECTOR METHOD PATH [--path a.b] [--where FIELD~REGEX] [--fields f1,f2] [--limit N]
              [--save FILE] [--set KEY=VALUE ... --change-id ID]
 
+  nw_http.py unifi-version      read-only: UniFi OS / console and Network application versions
+
+UniFi classic sessions are cached (NETWATCH_HOME/state, mode 600, never printed) and reused until a 401;
+a per-controller lock serializes logins; 429 and 5xx (GET only) retry with Retry-After or jittered
+backoff, at most about 60 seconds of waiting in total.
+
 CONNECTOR  unifi-int | unifi-classic | opnsense | pfsense | synology | omada | pihole | adguard | ha
 PATH       API path for that connector, for example /v1/sites (unifi-int) or, for synology,
            the query "api=SYNO.Core.System&version=1&method=info".
@@ -20,9 +26,11 @@ fresh change id (one approval = one invocation; the record is marked executed fi
 """
 import argparse
 import base64
+import hashlib
 import http.cookiejar
 import json
 import os
+import random
 import re
 import ssl
 import subprocess
@@ -30,6 +38,16 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
+
+try:
+    import fcntl  # Linux, macOS
+except ImportError:  # Windows
+    fcntl = None
+try:
+    import msvcrt  # Windows only
+except ImportError:
+    msvcrt = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.join(HERE, "..", "netwatch-setup")]
@@ -40,6 +58,10 @@ WRITABLE = ("unifi-int", "unifi-classic")
 SYNO_READ_METHODS = {"info", "get", "list", "check", "system_get", "status"}
 HA_PATHS = re.compile(r"^/(config|states(/[a-z_]+\.[A-Za-z0-9_]+)?)?$")
 TIMEOUT = 30
+SESSION_MAX_AGE = 8 * 3600       # a cached UniFi session is dropped after this even without a 401
+BACKOFF_TOTAL = float(os.environ.get("NW_HTTP_BACKOFF_TOTAL", "60"))  # seconds of waiting, all retries together
+BACKOFF_BASE = float(os.environ.get("NW_HTTP_BACKOFF_BASE", "2"))
+RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
 class Fail(Exception):
@@ -121,6 +143,212 @@ def gate_write(cid, summary):
     return cp
 
 
+def retry_after(hdr):
+    v = (hdr.get("Retry-After") if hdr else None) or ""
+    try:
+        return max(0.0, float(v.strip()))
+    except ValueError:
+        return None  # HTTP-date form: fall back to backoff
+
+
+def req_retry(c, method, url, headers=None, data=None, sleep=time.sleep):
+    """c.req with bounded retries. 429 always retries (the controller did not act); 5xx retries only for GET,
+    so a write is never sent twice. Waits honor Retry-After, else jittered exponential backoff; all waits
+    together stay under BACKOFF_TOTAL seconds."""
+    waited, attempt = 0.0, 0
+    while True:
+        st, raw, hdr = c.req(method, url, headers, data=data)
+        if st not in RETRY_STATUS or (st != 429 and method != "GET"):
+            return st, raw, hdr
+        ra = retry_after(hdr)
+        delay = ra if ra is not None else BACKOFF_BASE * (2 ** attempt) * (0.5 + random.random())
+        if waited + delay > BACKOFF_TOTAL:
+            return st, raw, hdr
+        sys.stderr.write(f"HTTP {st}; retrying in {delay:.1f}s\n")
+        sleep(delay)
+        waited += delay
+        attempt += 1
+
+
+def state_dir():
+    d = os.path.join(nw.netwatch_home(), "state")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def session_id(base, user):
+    return hashlib.sha256(f"{base}|{user}".encode()).hexdigest()[:12]
+
+
+class ControllerLock:
+    """Exclusive per-controller lock so concurrent helper runs serialize logins (and reuse one session).
+    POSIX: fcntl.flock. Windows: msvcrt.locking. Elsewhere: no lock (still correct, only less polite)."""
+
+    def __init__(self, path, timeout=120):
+        self.path, self.timeout, self.fh = path, timeout, None
+
+    def __enter__(self):
+        self.fh = open(self.path, "a+")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        end = time.time() + self.timeout
+        while True:
+            try:
+                if fcntl:
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif msvcrt:
+                    self.fh.seek(0)
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return self
+            except OSError:
+                if time.time() > end:
+                    raise Fail("LOCK-TIMEOUT: another Net Watch run holds the controller session lock; try again shortly")
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        try:
+            if fcntl:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+            elif msvcrt:
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        self.fh.close()
+
+
+def load_session(path, base, user):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            s = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(s, dict) or s.get("id") != session_id(base, user) or not isinstance(s.get("cookies"), dict)
+            or time.time() - float(s.get("saved", 0) or 0) > SESSION_MAX_AGE):
+        return None
+    return s
+
+
+def save_session(path, base, user, cookies, csrf):
+    nw.write_private(path, json.dumps({"id": session_id(base, user), "saved": time.time(), "cookies": cookies, "csrf": csrf or ""}))
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def drop_session(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def jar_cookies(c):
+    return {ck.name: ck.value for ck in c.jar}
+
+
+def unifi_classic(c, base, prefix, unifi_os, method, path, vals, body, sleep=time.sleep):
+    """Classic (cookie + CSRF) UniFi call with a cached session: reuse it until a 401, then log in again once.
+    The cache (NETWATCH_HOME/state/unifi-session-ID.json, mode 600, dir 700) is never printed."""
+    login = "/api/auth/login" if unifi_os else "/api/login"
+    user = vals["UNIFI_USER"]
+    sid = session_id(base, user)
+    sd = state_dir()
+    cache = os.path.join(sd, f"unifi-session-{sid}.json")
+    with ControllerLock(os.path.join(sd, f"unifi-{sid}.lock")):
+        sess = load_session(cache, base, user)
+
+        def do_login():
+            st, _, hdr = req_retry(c, "POST", base + login, data={"username": user, "password": vals["UNIFI_PASS"]}, sleep=sleep)
+            if st == 429:
+                raise Fail("LOGIN-FAIL HTTP 429: the controller is rate limiting logins and stayed limited after "
+                           f"{int(BACKOFF_TOTAL)}s of retries; wait a few minutes (another login may be running) and try again")
+            if st != 200:
+                raise Fail(f"LOGIN-FAIL HTTP {st}")
+            s = {"cookies": jar_cookies(c), "csrf": hdr.get("X-CSRF-Token") or ""}
+            save_session(cache, base, user, s["cookies"], s["csrf"])
+            return s
+
+        def do_req(s):
+            h = {}
+            if s.get("cookies"):
+                h["Cookie"] = "; ".join(f"{k}={v}" for k, v in s["cookies"].items())
+            if s.get("csrf"):
+                h["X-CSRF-Token"] = s["csrf"]
+            return req_retry(c, method, base + prefix + path, h, data=body, sleep=sleep)
+
+        fresh = sess is None
+        if fresh:
+            sess = do_login()
+        st, raw, hdr = do_req(sess)
+        if st == 401 and not fresh:  # cached session expired: one re-login, then one retry
+            drop_session(cache)
+            c.jar.clear()
+            sess = do_login()
+            st, raw, hdr = do_req(sess)
+        if st == 401:
+            drop_session(cache)
+        else:
+            cookies = dict(sess.get("cookies") or {}, **jar_cookies(c))
+            csrf = (hdr.get("X-Updated-CSRF-Token") or hdr.get("X-CSRF-Token") or sess.get("csrf")) if hdr else sess.get("csrf")
+            if cookies != sess.get("cookies") or csrf != sess.get("csrf") or fresh:
+                save_session(cache, base, user, cookies, csrf)
+        if st == 429:
+            raise Fail(f"RATE-LIMITED HTTP 429: the controller stayed limited after {int(BACKOFF_TOTAL)}s of retries; try again in a few minutes")
+        return st, raw
+
+
+def unifi_version(vals):
+    """Read-only: UniFi OS / console and Network application versions. Prints facts, never secrets."""
+    out = {}
+    errs = []
+    if vals.get("UNIFI_API_KEY"):
+        try:
+            st, raw = call("unifi-int", "GET", "/v1/info", vals)
+            j = as_json(raw) if st == 200 else None
+            if isinstance(j, dict) and j.get("applicationVersion"):
+                out["network_app_version"] = str(j["applicationVersion"])[:40]
+                out["source"] = "integration /v1/info"
+            else:
+                errs.append(f"integration /v1/info HTTP {st}")
+        except Fail as e:
+            errs.append(str(e)[:120])
+    if vals.get("UNIFI_USER") and vals.get("UNIFI_PASS"):
+        try:
+            st, raw = call("unifi-classic", "GET", "/api/s/default/stat/sysinfo", vals)
+            j = as_json(raw) if st == 200 else None
+            d = (j.get("data") or [{}])[0] if isinstance(j, dict) and isinstance(j.get("data"), list) and j["data"] else {}
+            if isinstance(d, dict) and d:
+                for src, dst in (("version", "network_app_version"), ("build", "network_app_build"),
+                                 ("console_display_version", "console_version"), ("udm_version", "unifi_os_version"),
+                                 ("hostname", "console_hostname"), ("ubnt_device_type", "console_model"),
+                                 ("update_available", "network_update_available")):
+                    if d.get(src) not in (None, ""):
+                        out.setdefault(dst, str(d[src])[:60])
+                out["source"] = (out.get("source", "") + "; " if out.get("source") else "") + "classic stat/sysinfo"
+            else:
+                errs.append(f"stat/sysinfo HTTP {st}")
+        except Fail as e:
+            errs.append(str(e)[:120])
+    if not out:
+        print("UNIFI-VERSION unknown: " + ("; ".join(errs) or "set UNIFI_HOST and UNIFI_API_KEY or UNIFI_USER/UNIFI_PASS"))
+        return 4
+    v = out.get("network_app_version", "")
+    out["network_app_major"] = v.split(".")[0] if v[:1].isdigit() else "?"
+    for k in sorted(out):
+        print(f"{k}={out[k]}")
+    for e in errs:
+        print(f"note: {e}")
+    return 0
+
+
 def call(conn, method, path, vals, body=None):
     """Return (status, raw_body)."""
     if conn.startswith("unifi"):
@@ -131,24 +359,10 @@ def call(conn, method, path, vals, body=None):
         prefix = "/proxy/network" if unifi_os else ""
         if conn == "unifi-int":
             nw.require(vals, "UNIFI_API_KEY")
-            st, raw, _ = c.req(method, f"{base}{prefix}/integration{path}", {"X-API-KEY": vals["UNIFI_API_KEY"]}, data=body)
+            st, raw, _ = req_retry(c, method, f"{base}{prefix}/integration{path}", {"X-API-KEY": vals["UNIFI_API_KEY"]}, data=body)
             return st, raw
         nw.require(vals, "UNIFI_USER", "UNIFI_PASS")
-        login, logout = ("/api/auth/login", "/api/auth/logout") if unifi_os else ("/api/login", "/api/logout")
-        st, _, hdr = c.req("POST", base + login, data={"username": vals["UNIFI_USER"], "password": vals["UNIFI_PASS"]})
-        if st != 200:
-            raise Fail(f"LOGIN-FAIL HTTP {st}")
-        h = {}
-        if hdr.get("X-CSRF-Token"):
-            h["X-CSRF-Token"] = hdr.get("X-CSRF-Token")
-        try:
-            st, raw, _ = c.req(method, base + prefix + path, h, data=body)
-        finally:
-            try:
-                c.req("POST", base + logout, h)
-            except Fail:
-                pass
-        return st, raw
+        return unifi_classic(c, base, prefix, unifi_os, method, path, vals, body)
     if conn == "opnsense":
         nw.require(vals, "OPNSENSE_URL", "OPNSENSE_KEY", "OPNSENSE_SECRET")
         c = Client(nw.verify_tls(vals, "OPNSENSE"))
@@ -249,6 +463,14 @@ def trim(obj, path, fields, limit, where=""):
 
 
 def main():
+    if sys.argv[1:2] == ["unifi-version"]:
+        if sys.argv[2:]:
+            print("usage: nw_http.py unifi-version", file=sys.stderr)
+            return 2
+        vals, probs = nw.load_env(nw.env_file_path(nw.os_family()), nw.os_family())
+        for p in probs:
+            print(p, file=sys.stderr)
+        return unifi_version(vals)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("connector", choices=CONNECTORS)
     ap.add_argument("method", type=str.upper)

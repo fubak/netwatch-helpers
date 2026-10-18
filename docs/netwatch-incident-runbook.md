@@ -31,3 +31,11 @@ Write a short incident note: timeline (owner's time zone), cause if known, actio
 ## Escalate outside the bot
 
 Suggest professional help or the ISP for: ransomware, financial account takeover, router compromise the owner cannot reset, anything involving threats or extortion (also local police/IC3). Never hack back or contact the attacker.
+
+## Short form (from netwatch-change-control)
+
+1. Severity: critical (exfiltration, ransomware, router or controller admin compromise), high (C2 signature, ARP spoofing, rogue DHCP, unknown admin login), medium (unknown device, unexpected port), low (hygiene). Tell the owner at once for high and critical, in plain words.
+2. Preserve evidence before containment: controller events, IDS alerts, DNS logs, inventory, lan_threats output, into NETWATCH_HOME/reports/incident-YYYYMMDD-HHMM.
+3. Contain with the least disruptive option, each as a change above: pause internet, quarantine VLAN, block on the controller (netwatch-unifi, or the brand's guide), close a forward or UPnP mapping, app steps for gear without an API, or the owner unplugging it. Confirm the target by MAC first and say how sure you are.
+4. Recovery is owner-led: reset or reinstall, update firmware, rotate passwords from a clean device, rotate Net Watch credentials if the scan host is suspect. Then a short incident note with change ids.
+5. Escalate to professionals, the ISP, or police for ransomware, account takeover, or extortion. Never hack back or contact the attacker.

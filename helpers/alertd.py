@@ -11,6 +11,14 @@ webhook: deduplicated, rate limited, low severity kept local, everything sanitiz
   alertd.py verify BATCH_ID             print the canonical copy of a forwarded batch
   alertd.py ingest FILE [--webhook]     dry run: classify syslog lines (or one webhook JSON) and show decisions
   alertd.py test [--severity high] [--send]   synthetic event; forwards only with --send
+  alertd.py owner add-admin NAME | add-device MAC_OR_IP | remove NAME_MAC_OR_IP | list
+                                        owner identity (NETWATCH_HOME/owner.json): audit events by a listed admin
+                                        from a listed LAN device are journaled as expected owner changes, not forwarded
+  alertd.py feedback ignore-signature SID_OR_TEXT --change-id ID | always-page SID_OR_TEXT --change-id ID |
+                     remove SID_OR_TEXT --change-id ID | list
+                                        owner feedback lists (NETWATCH_HOME/alert-feedback.json); every edit needs an approved
+                                        change.py id and marks it applied. Ignore never hides critical events or inbound
+                                        threats that were not blocked; always-page raises a match to at least high
   alertd.py service                     per-OS user-service instructions for the owner (prints, installs nothing)
 
 Secrets (owner's env file only): ALERT_INBOUND_TOKEN (what UniFi sends), ROUTINE_WEBHOOK_URL,
@@ -31,6 +39,7 @@ import secrets
 import socket
 import socketserver
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -52,9 +61,12 @@ BATCH_ID = re.compile(r"^nw-\d{8}T\d{6}-[0-9a-f]{8}$")
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "ignore": 4}
 DEFAULTS = {"dedupe_min": 30, "per_hour": 4, "per_day": 20, "medium_flush_min": 60, "quiet": "22-7",
             "storm_threshold": 30, "storm_window_min": 10, "storm_hold_min": 30, "unauth_alert": 20,
-            "http_rate_per_min": 60, "syslog_rate_per_min": 600}
+            "http_rate_per_min": 60, "syslog_rate_per_min": 600,
+            "refused_trusted_dedupe_h": 6, "leg_silence_h": 24}
+NOT_BLOCKED_NOTE = "inbound internet threat NOT blocked (allowed or action unknown; IDS detect-only?)"
+BLOCKED_ACTIONS = ("blocked", "block", "drop", "dropped", "deny", "denied", "reject", "rejected")
 FIELDS = ("kind", "name", "message", "src", "dst", "sport", "dport", "proto", "signature", "sid", "action", "risk",
-          "direction", "category", "subcategory", "device", "admin", "origin", "auth")
+          "direction", "category", "subcategory", "device", "admin", "origin", "auth", "src_mac")
 IP_FIELDS = ("src", "dst")
 BAD_SIG = re.compile(r"MALWARE|TROJAN|\bCNC\b|\bC2\b|BOTCC|COMPROMISED|EXPLOIT|RANSOM|COINMINER|ATTACK_RESPONSE|WORM|BACKDOOR|"
                      r"MOBILE_MALWARE|PHISHING|SHELLCODE", re.I)
@@ -101,6 +113,87 @@ def sanitize(ev):
     return out
 
 
+# ---------------------------------------------------------------- owner identity
+MAC_ANY = re.compile(r"^[0-9a-f]{2}([:-]?)[0-9a-f]{2}(\1[0-9a-f]{2}){4}$", re.I)
+OWNER_FOLD_S = 1800      # consecutive owner changes within 30 minutes fold into one journal entry
+OWNER_CHANGE_WINDOW_S = 3600  # an approved change applied within 60 minutes is named in the folded entry
+NEW_ADMIN = re.compile(r"\b(new|add(ed)?|creat(e|ed)|invit(e|ed))\b.{0,20}\badmin(istrator)?\b|\badmin(istrator)?\b.{0,20}\b(created|added|invited)\b", re.I)
+
+
+def norm_mac(v):
+    v = str(v or "").strip().lower()
+    if not MAC_ANY.match(v):
+        return ""
+    h = re.sub(r"[^0-9a-f]", "", v)
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2))
+
+
+def norm_name(v):
+    return re.sub(r"\s+", " ", str(v or "")).strip().casefold()
+
+
+def load_owner(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            o = json.load(fh)
+    except (OSError, ValueError):
+        return {"admins": [], "devices": []}
+    if not isinstance(o, dict):
+        return {"admins": [], "devices": []}
+    admins = [clean(a, 80) for a in o.get("admins", []) if isinstance(a, str) and a.strip()]
+    devs = []
+    for d in o.get("devices", []):
+        if isinstance(d, str):
+            m = norm_mac(d)
+            ip = ip_or_blank(d.strip())
+            if m or (ip and private(ip)):
+                devs.append(m or ip)
+    return {"admins": admins, "devices": devs}
+
+
+def owner_match(ev, owner):
+    """(True, why) only when BOTH the admin name is a trusted owner admin AND the source is a trusted private LAN
+    device. Syslog identity is unauthenticated, so the device check is never skipped. Public sources never match."""
+    if not owner or not owner.get("admins"):
+        return False, "no owner config"
+    if norm_name(ev.get("admin")) not in {norm_name(a) for a in owner["admins"]}:
+        return False, "admin not a trusted owner admin"
+    src = ev.get("src") or ""
+    if not src or not private(src):
+        return False, "source is not a private LAN address"
+    devs = set(owner.get("devices") or [])
+    mac = norm_mac(ev.get("src_mac"))
+    if src in devs or (mac and mac in devs):
+        return True, "trusted owner admin from a trusted owner device"
+    return False, "source device not trusted"
+
+
+# ---------------------------------------------------------------- owner feedback (ignore / always page)
+def load_feedback(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            f = json.load(fh)
+    except (OSError, ValueError):
+        return {"ignore": [], "page": []}
+    out = {}
+    for k in ("ignore", "page"):
+        out[k] = [clean(x.get("match"), 120) for x in (f.get(k) or []) if isinstance(x, dict) and clean(x.get("match"), 120)] \
+            if isinstance(f, dict) else []
+    return out
+
+
+def feedback_hit(ev, matches):
+    sid = str(ev.get("sid") or "")
+    text = f"{ev.get('signature') or ''} {ev.get('name') or ''}".casefold()
+    for m in matches:
+        if m.isdigit():
+            if sid and sid == m:
+                return m
+        elif len(m) >= 6 and m.casefold() in text:
+            return m
+    return ""
+
+
 # ---------------------------------------------------------------- parsing
 CEF_EXT = re.compile(r"(\w+)=((?:\\=|[^=])*?)(?=\s+\w+=|\s*$)")
 SURICATA = re.compile(r"\[(\d+):(\d+):(\d+)\]\s+(.*?)\s*\[Classification:\s*([^\]]*)\]\s*\[Priority:\s*(\d)\]\s*\{(\w+)\}\s*"
@@ -126,7 +219,7 @@ def parse_cef(text):
         kind = "ips"
     elif "firewall" in low:
         kind = "firewall"
-    elif "admin" in low:
+    elif "admin" in low or ext.get("UNIFIadmin"):
         kind = "admin"
     elif "internet" in low or "wan" in low:
         kind = "internet"
@@ -144,7 +237,8 @@ def parse_cef(text):
             "signature": ext.get("UNIFIipsSignature", ""), "sid": ext.get("UNIFIipsSignatureId"), "action": act.lower(),
             "risk": ext.get("UNIFIrisk", "").lower(), "direction": ext.get("UNIFIdirection", "").lower(), "category": cat,
             "subcategory": sub, "device": ext.get("UNIFIhost") or ext.get("UNIFIdeviceName", ""),
-            "admin": ext.get("UNIFIadmin", ""), "cef_severity": parts[6] if parts[6].isdigit() else None,
+            "admin": ext.get("UNIFIadmin", ""),
+            "src_mac": norm_mac(ext.get("smac") or ext.get("UNIFIclientMac") or ext.get("UNIFIsrcMac") or ""), "cef_severity": parts[6] if parts[6].isdigit() else None,
             "class_id": parts[4]}
 
 
@@ -231,7 +325,7 @@ def classify(ev):
     msg = (ev.get("message") or "").lower()
     src, dst = ev.get("src") or "", ev.get("dst") or ""
     risk = ev.get("risk") or ""
-    blocked = (ev.get("action") or "") in ("blocked", "drop", "dropped", "deny", "denied", "reject")
+    blocked = str(ev.get("action") or "").strip().lower() in BLOCKED_ACTIONS  # missing/unknown action counts as NOT blocked
     prio = ev.get("priority")
     if k == "test":
         return ev.get("test_severity", "high"), "synthetic test event"
@@ -254,12 +348,16 @@ def classify(ev):
             return "high", "IDS/IPS alert from a LAN device to the internet"
         if blocked:
             return ("medium" if bad and risk in ("high", "critical") else "low"), "inbound internet threat already blocked (background noise unless repeated)"
-        return ("high" if bad else "medium"), "inbound internet threat NOT blocked (IDS detect-only?)"
+        # Severity floor (owner-approved change 20261018-074528-2bf7): any inbound internet IPS event that was not
+        # blocked is high regardless of signature, so it bypasses quiet hours and digests.
+        return "high", NOT_BLOCKED_NOTE
     if k == "lan-threat" or re.search(r"rogue (dhcp|ap)|arp spoof|ip conflict|duplicate ip", name + " " + msg):
         return "high", "LAN threat indicator (rogue DHCP/AP, ARP spoofing, IP conflict)"
     if k == "admin":
         if re.search(r"fail|invalid|denied|unauthori", name + " " + msg):
-            return ("high" if src and not private(src) else "medium"), "failed admin login"
+            return "high", "failed admin login"
+        if NEW_ADMIN.search(name + " " + msg):
+            return "high", "new admin account"
         if src and not private(src):
             return "high", "admin access from a public address"
         if "config" in name or "change" in name:
@@ -308,8 +406,13 @@ def in_quiet(t, quiet):
 class Relay:
     """All state transitions; network and clock are injected so tests can drive it."""
 
-    def __init__(self, adir, cfg=None, sender=None, clock=time.time, host=""):
+    def __init__(self, adir, cfg=None, sender=None, clock=time.time, host="", owner_path=None, changes_dir=None):
         self.adir = adir
+        self.owner_path = owner_path or os.path.join(os.path.dirname(os.path.abspath(adir)), "owner.json")
+        self.changes_dir = changes_dir or os.path.join(os.path.dirname(os.path.abspath(adir)), "changes")
+        self._owner, self._owner_mtime = {"admins": [], "devices": []}, None
+        self.feedback_path = os.path.join(os.path.dirname(self.owner_path), "alert-feedback.json")
+        self._fb, self._fb_mtime = {"ignore": [], "page": []}, None
         self.cfg = dict(DEFAULTS, **(cfg or {}))
         self.sender = sender
         self.clock = clock
@@ -336,13 +439,18 @@ class Relay:
         self.retry_at = st.get("retry_at", 0)
         self.fail_count = st.get("fail_count", 0)
         self.last_forward = st.get("last_forward", {})
-        self.legs = st.get("legs", {})            # "syslog" / "webhook" -> {"last": iso, "count": n}
+        self.legs = st.get("legs", {})            # "syslog" / "webhook" -> {"last": iso, "count": n, "ts": epoch}
+        self.refused_log = st.get("refused_log", [])  # [epoch, reason, trusted] for the last 24 hours (bounded)
+        self.health = st.get("health", {})        # alert dedupe: refused_trusted_at, silent_<leg>, unparsed_base
+        self.started = st.get("started") or self.clock()
+        self.owner_fold = st.get("owner_fold") or {}  # open fold of expected owner changes (journaled when it closes)
 
     # -- persistence
     def save(self):
         st = {k: getattr(self, k) for k in ("seen", "forwards", "urgent", "medium", "storm_until", "storm_noticed",
                                              "storm_suppressed", "recent_hi", "last_medium_flush", "counters", "unauth",
-                                             "retry_at", "fail_count", "last_forward", "legs")}
+                                             "retry_at", "fail_count", "last_forward", "legs", "refused_log", "health",
+                                             "started", "owner_fold")}
         nw.write_private(os.path.join(self.adir, "state.json"), json.dumps(st))
 
     def journal(self, rec):
@@ -365,24 +473,136 @@ class Relay:
         with self.lock:
             rec = self.legs.get(leg) if isinstance(self.legs.get(leg), dict) else {}
             now = self.clock()
-            self.legs[leg] = {"last": iso(now), "count": int(rec.get("count", 0) or 0) + 1}
+            self.legs[leg] = {"last": iso(now), "count": int(rec.get("count", 0) or 0) + 1, "ts": now}
+            if self.health.get("silent_" + leg):  # the leg recovered: allow a future silence alert again
+                self.health["silent_" + leg] = False
+                self.save()
             if not rec or now - getattr(self, "_leg_saved", 0) >= 60:  # first proof saved at once; then at most once a minute
                 self._leg_saved = now
                 self.save()
+
+    # -- owner identity
+    def owner(self):
+        """owner.json, re-read when it changes on disk (so `alertd.py owner ...` applies without a restart)."""
+        try:
+            m = os.path.getmtime(self.owner_path)
+        except OSError:
+            m = None
+        if m != self._owner_mtime:
+            self._owner_mtime = m
+            self._owner = load_owner(self.owner_path) if m is not None else {"admins": [], "devices": []}
+        return self._owner
+
+    def feedback(self):
+        try:
+            m = os.path.getmtime(self.feedback_path)
+        except OSError:
+            m = None
+        if m != self._fb_mtime:
+            self._fb_mtime = m
+            self._fb = load_feedback(self.feedback_path) if m is not None else {"ignore": [], "page": []}
+        return self._fb
+
+    def recent_changes(self, t):
+        """Ids of change.py records approved and then applied/executed within the last 60 minutes."""
+        out = []
+        try:
+            names = sorted(os.listdir(self.changes_dir))
+        except OSError:
+            return out
+        for n in names[-200:]:
+            if not n.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(self.changes_dir, n), encoding="utf-8") as fh:
+                    r = json.load(fh)
+                if not r.get("approved_at"):
+                    continue
+                for h in r.get("history") or []:
+                    if h.get("status") in ("applied", "executed") and \
+                            0 <= t - dt.datetime.fromisoformat(h["at"]).timestamp() <= OWNER_CHANGE_WINDOW_S:
+                        out.append(clean(r.get("id"), 40))
+                        break
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                continue
+        return out
+
+    def close_owner_fold(self, t=None, force=False):
+        """Journal the open fold once it is 30 minutes old (or when forced)."""
+        f = self.owner_fold
+        if not f:
+            return False
+        t = self.clock() if t is None else t
+        if not force and t - f.get("last_t", 0) < OWNER_FOLD_S:
+            return False
+        rec = dict(f.get("sample") or {}, severity="low", why="expected owner change", decision="journal-only (owner change)",
+                   folded=f.get("count", 1), first=f.get("first"), last=f.get("last"), names=f.get("names", [])[:20],
+                   approved_changes=sorted(set(f.get("changes", [])))[:10])
+        if rec["approved_changes"]:
+            rec["message"] = clean(f"{rec['folded']} owner change(s); approved change(s) applied within 60 min: "
+                                   + ", ".join(rec["approved_changes"]), 300)
+        else:
+            rec["message"] = clean(f"{rec['folded']} owner change(s); no approved change.py record applied within 60 min", 300)
+        self.journal(rec)
+        self.owner_fold = {}
+        self.bump("owner_folds_journaled")
+        return True
+
+    def _owner_change(self, rec, t):
+        f = self.owner_fold
+        if f and t - f.get("last_t", 0) >= OWNER_FOLD_S:
+            self.close_owner_fold(t, force=True)
+            f = self.owner_fold
+        if not f:
+            f = self.owner_fold = {"first": rec["at"], "count": 0, "names": [], "changes": [], "sample": rec}
+        f["count"] += 1
+        f["last"], f["last_t"] = rec["at"], t
+        if rec.get("name") and rec["name"] not in f["names"]:
+            f["names"].append(rec["name"])
+        f["changes"] = sorted(set(f["changes"]) | set(self.recent_changes(t)))
+        self.bump("owner_changes")
 
     # -- intake
     def ingest(self, raw_ev, dry=False):
         ev = sanitize(raw_ev)
         if raw_ev.get("kind") == "test":
             ev["kind"] = "test"
+        if ev.get("src_mac"):
+            ev["src_mac"] = norm_mac(ev["src_mac"])
         sev, why = classify(dict(raw_ev, **{k: ev[k] for k in ev if ev[k] not in (None, "")}))
+        owner_change = False
+        if ev.get("kind") == "admin" and why not in ("failed admin login", "new admin account"):
+            own = self.owner()
+            if own.get("admins"):
+                hit, reason = owner_match(ev, own)
+                if hit:
+                    sev, why, owner_change = "low", "expected owner change", True
+                elif SEV_ORDER.get(sev, 9) > SEV_ORDER["medium"]:
+                    sev, why = "medium", f"admin event not from the owner ({reason})"
+        fb = self.feedback()
+        if not owner_change and ev.get("kind") not in ("test", "relay") and (fb["page"] or fb["ignore"]):
+            hit = feedback_hit(ev, fb["page"])
+            if hit:
+                if SEV_ORDER.get(sev, 9) > SEV_ORDER["high"]:
+                    sev = "high"
+                why = f"{why}; owner asked to always page ({hit})"
+            else:
+                hit = feedback_hit(ev, fb["ignore"])
+                # never hidden: critical, honeypot, or the approved inbound-not-blocked severity floor
+                if hit and sev in ("medium", "high") and NOT_BLOCKED_NOTE not in why and ev.get("kind") != "honeypot":
+                    sev, why = "low", f"owner ignored this signature ({hit})"
         t = self.clock()
         key = hashlib.sha256("|".join(str(ev.get(k) or "") for k in ("kind", "sid", "signature", "name", "src", "dst")).encode()).hexdigest()[:16]
         rec = dict(ev, severity=sev, why=why, key=key, at=iso(t))
         if dry:
-            return rec, self.decide(rec, t, dry=True)
+            return rec, ("journal-only (owner change)" if owner_change else self.decide(rec, t, dry=True))
         with self.lock:
             self.bump(f"in_{sev}")
+            if owner_change:
+                rec["decision"] = decision = "journal-only (owner change)"
+                self._owner_change(rec, t)
+                self.save()
+                return rec, decision
             decision = self.decide(rec, t)
             rec["decision"] = decision
             if sev != "ignore":
@@ -435,16 +655,81 @@ class Relay:
             del q[MAX_QUEUE:]
             self.bump("queue_dropped", dropped)
 
-    def unauthorized(self, ip, reason):
+    def unauthorized(self, ip, reason, trusted=False):
+        """Count a refused request. trusted=True means it came from a configured alert source (the console):
+        a bad or missing token from there means the UniFi side is misconfigured or the token leaked, so the
+        FIRST one raises a high alert at once (at most once per refused_trusted_dedupe_h hours)."""
         with self.lock:
             t = self.clock()
             self.bump(f"refused_{reason}")
+            self.refused_log = [x for x in self.refused_log if isinstance(x, list) and t - x[0] < 86400][-999:] + [[t, reason, bool(trusted)]]
             self.unauth = [x for x in self.unauth if t - x < 600] + [t]
+            if trusted and reason == "token":
+                last = self.health.get("refused_trusted_at", 0) or 0
+                if t - last >= self.cfg["refused_trusted_dedupe_h"] * 3600:
+                    self.health["refused_trusted_at"] = t
+                    n24 = sum(1 for x in self.refused_log if x[1] == "token" and x[2])
+                    self.ingest({"kind": "relay", "name": "Trusted source sent a refused webhook (bad or missing token)",
+                                 "message": f"the alert source posted without a valid token; {n24} such refusals in 24h. "
+                                            "Check the Alarm Manager webhook token on the console", "src": ip,
+                                 "origin": "relay"})
             if len(self.unauth) == self.cfg["unauth_alert"]:
                 self.ingest({"kind": "relay", "name": "Repeated refused posts to the Net Watch relay",
                              "message": f"{len(self.unauth)} refused requests in 10 minutes ({reason})", "src": ip,
                              "origin": "relay"})
             self.save()
+
+    def refused_24h(self, t=None):
+        t = self.clock() if t is None else t
+        return sum(1 for x in self.refused_log if isinstance(x, list) and t - x[0] < 86400)
+
+    def leg_last_ts(self, leg):
+        rec = self.legs.get(leg) if isinstance(self.legs.get(leg), dict) else {}
+        if rec.get("ts"):
+            return float(rec["ts"])
+        try:  # state written by older versions only has the iso string
+            return dt.datetime.fromisoformat(rec["last"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def leg_problems(self, t=None):
+        """Return {leg: reason} for legs that look broken right now."""
+        t = self.clock() if t is None else t
+        lim = self.cfg["leg_silence_h"] * 3600
+        out = {}
+        for leg in ("syslog", "webhook"):
+            last = self.leg_last_ts(leg)
+            ref = last if last is not None else self.started
+            if t - ref >= lim:
+                out[leg] = (f"nothing received for {int((t - ref) // 3600)}h" if last is not None
+                            else f"nothing received since the relay started {int((t - ref) // 3600)}h ago")
+        unparsed = self.counters.get("webhook_unparsed", 0)
+        if unparsed > self.health.get("unparsed_base", 0):
+            out["webhook"] = (out.get("webhook", "") + "; " if "webhook" in out else "") + f"webhook_unparsed={unparsed} (unknown body shape)"
+        return out
+
+    def check_health(self):
+        """Raise one high alert per broken leg; it stays deduplicated until the leg recovers."""
+        with self.lock:
+            t = self.clock()
+            probs = self.leg_problems(t)
+            raised = []
+            for leg, why in probs.items():
+                if self.health.get("silent_" + leg):
+                    continue
+                self.health["silent_" + leg] = True
+                if "unparsed" in why:
+                    self.health["unparsed_base"] = self.counters.get("webhook_unparsed", 0)
+                self.ingest({"kind": "relay", "name": f"Alert leg {leg} unhealthy", "message": why, "origin": "relay"})
+                raised.append(leg)
+            if raised:
+                self.save()
+            return raised
+
+    def webhook_parsed(self):
+        """A webhook with a known shape arrived: the unparsed condition is cleared."""
+        with self.lock:
+            self.health["unparsed_base"] = self.counters.get("webhook_unparsed", 0)
 
     # -- output
     def budget_ok(self, t):
@@ -656,7 +941,7 @@ def make_handler(relay, token, allowed, limiter):
                 relay.unauthorized(ip, "size")
                 return self.reply(413)
             if not token_ok(self.headers, token):
-                relay.unauthorized(ip, "token")
+                relay.unauthorized(ip, "token", trusted=bool(allowed) and ip in allowed)
                 return self.reply(401)
             try:
                 obj = json.loads(self.rfile.read(n).decode("utf-8", "replace"))
@@ -667,6 +952,8 @@ def make_handler(relay, token, allowed, limiter):
             evs = parse_webhook(obj)
             if not evs:
                 relay.bump("webhook_unparsed")  # unknown body shape; the journal keeps nothing, status shows the count
+            else:
+                relay.webhook_parsed()
             for ev in evs[:50]:
                 ev["auth"] = "token"
                 relay.ingest(ev)
@@ -773,6 +1060,10 @@ def cmd_serve(a):
     try:
         while True:
             time.sleep(5)
+            with relay.lock:
+                if relay.close_owner_fold():
+                    relay.save()
+            relay.check_health()
             relay.tick()
     except KeyboardInterrupt:
         pass
@@ -795,9 +1086,16 @@ def cmd_status(_a):
     print(f"pending urgent={len(r.urgent)} medium={len(r.medium)} storm={'on' if t < r.storm_until else 'off'} "
           f"forwards_24h={len(r.forwards)} budget_ok={ok}")
     print("counters " + " ".join(f"{k}={v}" for k, v in sorted(r.counters.items())))
+    probs = r.leg_problems(t)
     for leg in ("syslog", "webhook"):
         rec = r.legs.get(leg) if isinstance(r.legs.get(leg), dict) else None
-        print(f"leg_{leg}=" + (f"proven last={rec.get('last')} count={rec.get('count')}" if rec else "not yet"))
+        state = "proven" if rec else "not yet"
+        if leg in probs:
+            state = "SILENT" if "nothing" in probs[leg] else "UNPARSED"
+        extra = f" unparsed={r.counters.get('webhook_unparsed', 0)}" if leg == "webhook" else ""
+        print(f"leg_{leg}={state} last_seen={(rec or {}).get('last') or 'never'} count={(rec or {}).get('count', 0)}{extra}"
+              + (f" problem=\"{probs[leg]}\"" if leg in probs else ""))
+    print(f"refused_24h={r.refused_24h(t)} refused_trusted_24h={sum(1 for x in r.refused_log if isinstance(x, list) and t - x[0] < 86400 and x[2])}")
     if r.last_forward:
         print("last_forward " + " ".join(f"{k}={v}" for k, v in r.last_forward.items()))
     return 0
@@ -937,6 +1235,124 @@ def service_sources():
     return sorted(allowed_sources(vals or {}, osf))
 
 
+def feedback_path():
+    return os.path.join(nw.netwatch_home(), "alert-feedback.json")
+
+
+def cmd_feedback(a):
+    path = feedback_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            f = json.load(fh)
+        if not isinstance(f, dict):
+            raise ValueError
+    except FileNotFoundError:
+        f = {}
+    except (OSError, ValueError):
+        print(f"REFUSED: {path} is not valid JSON; fix or remove it first")
+        return 3
+    f.setdefault("ignore", [])
+    f.setdefault("page", [])
+    if a.action == "list":
+        print(f"feedback_file={path}")
+        for k, label in (("ignore", "ignored"), ("page", "always_page")):
+            print(f"{label}=" + (" | ".join(f"{x.get('match')} (change {x.get('change')})" for x in f[k]) or "none"))
+        return 0
+    val = clean((a.value or "").strip(), 120)
+    if not val or (not val.isdigit() and len(val) < 6):
+        print("REFUSED: give a signature id (digits) or at least 6 characters of the signature text")
+        return 2
+    if not a.change_id:
+        print("REFUSED: feedback changes need an approved change id (--change-id); propose one with change.py new")
+        return 3
+    cp = os.path.join(HERE, "change.py")
+    r = subprocess.run([sys.executable, cp, "check", a.change_id], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"REFUSED: change {a.change_id} not approved or expired")
+        return 3
+    if a.action == "remove":
+        before = len(f["ignore"]) + len(f["page"])
+        for k in ("ignore", "page"):
+            f[k] = [x for x in f[k] if str(x.get("match", "")).casefold() != val.casefold()]
+        if len(f["ignore"]) + len(f["page"]) == before:
+            print(f"not found: {val}")
+            return 1
+    else:
+        k = "ignore" if a.action == "ignore-signature" else "page"
+        other = "page" if k == "ignore" else "ignore"
+        f[other] = [x for x in f[other] if str(x.get("match", "")).casefold() != val.casefold()]
+        if not any(str(x.get("match", "")).casefold() == val.casefold() for x in f[k]):
+            f[k].append({"match": val, "change": clean(a.change_id, 40), "at": iso(time.time())})
+    nw.write_private(path, json.dumps(f, indent=2) + "\n")
+    subprocess.run([sys.executable, cp, "applied", a.change_id, "--result", f"alertd feedback {a.action} {val}"], capture_output=True, text=True)
+    print(f"{a.action} ok: {val} (change {a.change_id} applied; the running relay reloads the list on change)")
+    return 0
+
+
+def owner_path():
+    return os.path.join(nw.netwatch_home(), "owner.json")
+
+
+def cmd_owner(a):
+    path = owner_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            o = json.load(fh)
+        if not isinstance(o, dict):
+            raise ValueError
+    except FileNotFoundError:
+        o = {}
+    except (OSError, ValueError):
+        print(f"REFUSED: {path} is not valid JSON; fix or remove it first")
+        return 3
+    o.setdefault("admins", [])
+    o.setdefault("devices", [])
+    if a.action == "list":
+        print(f"owner_file={path}")
+        print("admins=" + (" | ".join(o["admins"]) or "none"))
+        print("devices=" + (", ".join(o["devices"]) or "none"))
+        if o["admins"] and not o["devices"]:
+            print("note: no trusted devices yet, so nothing is suppressed (the device check is mandatory)")
+        return 0
+    val = (a.value or "").strip()
+    if not val:
+        print("REFUSED: a value is required")
+        return 2
+    if a.action == "add-admin":
+        name = clean(val, 80)
+        if norm_name(name) not in {norm_name(x) for x in o["admins"]}:
+            o["admins"].append(name)
+    elif a.action == "add-device":
+        m, ip = norm_mac(val), ip_or_blank(val)
+        if not m and not ip:
+            print("REFUSED: add-device takes a MAC (aa:bb:cc:dd:ee:ff) or an IP address")
+            return 2
+        if ip and not private(ip):
+            print("REFUSED: only private LAN addresses can be trusted owner devices")
+            return 3
+        if ip:
+            try:
+                if not nw.in_nets(ip, nw.load_scope()):
+                    print("REFUSED: device IP is outside scope.txt")
+                    return 3
+            except (FileNotFoundError, ValueError):
+                pass
+        v = m or ip
+        if v not in o["devices"]:
+            o["devices"].append(v)
+    elif a.action == "remove":
+        key = norm_mac(val) or ip_or_blank(val) or val
+        before = len(o["admins"]) + len(o["devices"])
+        o["admins"] = [x for x in o["admins"] if norm_name(x) != norm_name(val)]
+        o["devices"] = [x for x in o["devices"] if x != key]
+        if len(o["admins"]) + len(o["devices"]) == before:
+            print(f"not found: {val}")
+            return 1
+    nw.write_private(path, json.dumps(o, indent=2) + "\n")
+    print(f"{a.action} ok; admins={len(o['admins'])} devices={len(o['devices'])} (the running relay reloads owner.json on change)")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -956,8 +1372,15 @@ def main(argv=None):
     p = sub.add_parser("test")
     p.add_argument("--severity", default="high", choices=["critical", "high", "medium"])
     p.add_argument("--send", action="store_true")
+    p = sub.add_parser("feedback")
+    p.add_argument("action", choices=["ignore-signature", "always-page", "remove", "list"])
+    p.add_argument("value", nargs="?", default="")
+    p.add_argument("--change-id", default="")
+    p = sub.add_parser("owner")
+    p.add_argument("action", choices=["add-admin", "add-device", "remove", "list"])
+    p.add_argument("value", nargs="?", default="")
     a = ap.parse_args(argv)
-    return {"serve": cmd_serve, "status": cmd_status, "verify": cmd_verify, "ingest": cmd_ingest,
+    return {"feedback": cmd_feedback, "owner": cmd_owner, "serve": cmd_serve, "status": cmd_status, "verify": cmd_verify, "ingest": cmd_ingest,
             "test": cmd_test, "service": cmd_service}[a.cmd](a)
 
 

@@ -22,7 +22,51 @@ PROTECTED_ENV = re.compile(
     r"^(PATH|PATHEXT|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|SYSTEMROOT|COMSPEC|IFS|ENV|BASH_ENV|SHELL|"
     r"LD_.*|DYLD_.*|PYTHON.*|NETWATCH_.*|NW_.*|CURL_.*|SSL_.*|REQUESTS_CA_BUNDLE|"
     r"HTTPS?_PROXY|ALL_PROXY|NO_PROXY)$", re.I)
-SECRET_KEY = re.compile(r"(passphrase|password|passwd|psk|secret|token|private|^x_|_key$|^key$|apikey|api_key|cookie|^sid$|session)", re.I)
+# Redaction allowlist of real secret field names. The old broad patterns (^key$, _key$, session) also stripped
+# harmless UniFi fields such as rest/setting "key": "mgmt"; those must survive so setting objects stay readable.
+SECRET_NAMES = frozenset(n.lower() for n in (
+    # generic credentials
+    "password", "passwd", "pass", "pwd", "passphrase", "secret", "token", "api_key", "apikey", "api_token",
+    "access_token", "refresh_token", "id_token", "auth_token", "bearer", "client_secret", "private_key", "privkey",
+    "secret_key", "shared_secret", "shared_key", "pre_shared_key", "presharedkey", "psk", "wpa_psk", "wpa_key",
+    "wep_key", "wpa_passphrase", "auth_key", "authkey", "mgmt_key", "community", "snmp_community",
+    # HTTP session material
+    "cookie", "cookies", "set-cookie", "csrf", "csrf_token", "x-csrf-token", "x_csrf_token", "authorization",
+    "sid", "session", "sessionid", "session_id", "session_token", "session_cookie", "unifises",
+    # RADIUS / VPN
+    "radius_secret", "radius_key", "auth_secret", "acct_secret", "ipsec_key", "ipsec_psk", "wireguard_private_key",
+    "openvpn_key", "tls_key", "ovpn_key",
+    # UniFi Network x_ fields (wlanconf, setting/mgmt, radiusprofile, networkconf, device, account)
+    "x_passphrase", "x_password", "x_secret", "x_shadow", "x_private_key", "x_iapp_key", "x_ssh_password",
+    "x_ssh_keys", "x_ssh_key", "x_ssh_username", "x_authkey", "x_auth_key", "x_api_key", "x_mgmt_key",
+    "x_ipsec_pre_shared_key", "x_wireguard_private_key", "x_openvpn_shared_secret_key", "x_ca_key",
+    "x_server_key", "x_tls_key", "x_vwirekey", "x_vwire_key", "x_pppoe_password", "x_radius_secret",
+    "x_mesh_psk", "x_wpa_psk", "x_wep_key", "x_sae_psk", "x_hotspot_password", "x_snmp_community",
+    "wpa_psk_hex", "sae_psk", "private_preshared_keys",
+))
+# Name fragments that only ever mean a secret. "key" alone is deliberately NOT here.
+SECRET_FRAGMENTS = ("password", "passphrase", "passwd", "secret", "token", "private_key", "preshared", "pre_shared",
+                    "psk", "cookie", "csrf", "_shadow", "ssh_key")
+
+
+class _SecretKey:
+    """Drop-in for the old regex: .search(name) is truthy when name is a known secret field.
+    UniFi x_ fields stay redacted by default (UniFi's convention for credential fields); x_ fields known to be
+    harmless can be listed in X_SAFE."""
+    X_SAFE = frozenset()
+
+    def search(self, name):
+        n = str(name).strip().lower()
+        if n in SECRET_NAMES or any(f in n for f in SECRET_FRAGMENTS):
+            return True
+        if n.startswith("x_") and n not in self.X_SAFE:
+            return True
+        return False
+
+
+SECRET_KEY = _SecretKey()
+NW_VERSION = "v1.2.0"  # helper bundle version; build_bundle.py refuses a bundle whose VERSION differs
+OWN_DEVICES_MARKER = "# netwatch: own-devices-only"  # scope.txt line for ISP or landlord routers: single addresses only
 MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
 
@@ -259,12 +303,28 @@ def load_scope(home=None):
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
     nets = []
+    own_only = False
     with open(path, encoding="utf-8-sig") as fh:
         for raw in fh:
+            if raw.strip().lower() == OWN_DEVICES_MARKER:
+                own_only = True
             line = raw.split("#", 1)[0].strip()
             if line:
                 nets.append(ipaddress.ip_network(line, strict=False))
+    if own_only:  # ISP or landlord router: the owner's own devices only, never a subnet sweep
+        wide = [str(n) for n in nets if n.num_addresses > 1]
+        if wide:
+            raise ValueError("own-devices-only scope allows single addresses (/32 or /128) only, not " + ", ".join(wide))
     return nets
+
+
+def scope_mode(home=None):
+    """'own-devices-only' when scope.txt carries the marker line, else 'subnet'."""
+    try:
+        with open(os.path.join(home or netwatch_home(), "scope.txt"), encoding="utf-8-sig") as fh:
+            return "own-devices-only" if any(l.strip().lower() == OWN_DEVICES_MARKER for l in fh) else "subnet"
+    except OSError:
+        return "subnet"
 
 
 def scope_problems(targets, nets):

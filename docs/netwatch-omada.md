@@ -24,3 +24,14 @@ Keep the double quotes around paths with `&` (cmd and PowerShell treat a bare `&
 ## Writes
 
 Client block and SSID or ACL changes: only through netwatch-change-control; the Open API app would need an admin role for writes and the helper is read-only for Omada, so the owner acts in the Omada app with exact steps.
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw nw_http.py omada GET "/sites?page=1&pageSize=100" --path result.data --fields siteId,name
+```
+
+- PASS: stderr shows `HTTP 200` and at least one site name prints.
+- FAIL: `HTTP 401` or `HTTP 403` (check OMADA_CLIENT_ID, OMADA_CLIENT_SECRET, OMADA_OMADAC_ID and the app's site access), a timeout (OMADA_URL or port), or exit 4. Give the owner one line, mark the connector untested, and continue setup.

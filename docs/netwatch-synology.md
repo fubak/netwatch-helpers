@@ -23,3 +23,14 @@ Always write GET: it marks the call as a read (the helper sends DSM's form post 
 ## Checks
 
 DSM up to date and auto-update for security fixes on, Security Advisor clean, QuickConnect and port forwards to 5000/5001 off unless needed (prefer VPN), admin account disabled, auto-block on, SMB1 off, SSH off, Hyper Backup jobs succeeding, snapshots on (ransomware recovery). Changes go through netwatch-change-control.
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw nw_http.py synology GET "api=SYNO.Core.System&version=1&method=info" --path data --fields model,firmware_ver
+```
+
+- PASS: `HTTP 200` and the model and firmware version print.
+- FAIL: an error code in the reply (wrong user or 2-step verification on that account), `HTTP 401`, or exit 4. Give the owner one line, mark the connector untested, and continue setup.

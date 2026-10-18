@@ -28,3 +28,14 @@ Without SSH: ask for screenshots of Network Map clients, WAN > Virtual Server / 
 ## Changes
 
 Owner applies in the Asus web UI or app with exact steps; record each in netwatch-change-control.
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw asus_ssh.py firmware
+```
+
+- PASS: a firmware version line prints.
+- FAIL: an SSH error (SSH not enabled on the router, wrong ASUS_SSH_HOST or user, host key not yet accepted by the owner) or a non-zero exit. Give the owner one line, mark the connector untested, and continue setup.

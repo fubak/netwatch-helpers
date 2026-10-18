@@ -14,7 +14,21 @@ Installs nothing. Usage:
   preflight.py --env-template [--gear unifi|none] [--no-alerts]
                                    print an env file template with placeholders only; the
                                    gateway is prefilled. Never opens the env file and never writes.
+  preflight.py --drift [--bin DIR] [--manifest FILE]
+                                   sha256 of every helper in bin/ (default: the folder this script
+                                   runs from) against MANIFEST.sha256 (default: bin/MANIFEST.sha256,
+                                   shipped in the bundle). One OK/STALE/MISSING/EXTRA line per file;
+                                   exit 0 clean, 1 drift, 2 manifest missing or unreadable. Read-only.
+  preflight.py --health            one GREEN/YELLOW/RED line each: connectors, relay legs, last routine run,
+                                   disk, open changes, drift, TLS settings. Read-only; exit 1 if any RED.
+  preflight.py --mark-routine NAME record that routine NAME ran now (NETWATCH_HOME/state/routine-NAME.last)
+  preflight.py --release-check --repo OWNER/NAME [--api URL] [--installed vX.Y.Z]
+                                   read-only: compare the installed helper version with the latest GitHub
+                                   release. Prints the result only; never downloads, and never takes a
+                                   fingerprint from the API (a new one arrives only with an updated skill).
 """
+import datetime as dt
+import hashlib
 import json
 import os
 import platform
@@ -22,6 +36,9 @@ import re
 import shutil
 import socket
 import sys
+import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.join(HERE, "..", "netwatch-setup")]
@@ -250,12 +267,279 @@ def env_template(osf, gear=None, alerts=True):
     return "\n".join(lines) + "\n"
 
 
-USAGE = "usage: preflight.py [--suggest-scope | --detect [--json] | --env-template [--gear unifi|none] [--no-alerts]]"
+USAGE = "usage: preflight.py [--suggest-scope | --detect [--json] | --env-template [--gear unifi|none] [--no-alerts] | --drift [--bin DIR] [--manifest FILE] | --health | --mark-routine NAME | --release-check --repo OWNER/NAME [--api URL] [--installed V]]"
+
+
+MANIFEST = "MANIFEST.sha256"
+MANIFEST_LINE = re.compile(r"^([0-9a-f]{64})\s+\*?([A-Za-z0-9_.-]+)$")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_manifest(path):
+    """{name: sha256}. Raises ValueError on a malformed line (a manifest with junk is not trusted)."""
+    out = {}
+    with open(path, encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = MANIFEST_LINE.match(line)
+            if not m or "/" in m.group(2) or m.group(2) in (".", ".."):
+                raise ValueError(f"malformed manifest line {n}")
+            out[m.group(2)] = m.group(1)
+    return out
+
+
+def drift(bin_dir, manifest_path):
+    """Return (rows, drifted). rows: (STATE, name, actual_sha or '', expected_sha or '')."""
+    want = read_manifest(manifest_path)
+    have = {f: sha256_file(os.path.join(bin_dir, f)) for f in sorted(os.listdir(bin_dir))
+            if f.endswith(".py") and os.path.isfile(os.path.join(bin_dir, f))}
+    rows = []
+    for name in sorted(set(want) | set(have)):
+        if name in want and name in have:
+            rows.append(("OK" if want[name] == have[name] else "STALE", name, have[name], want[name]))
+        elif name in want:
+            rows.append(("MISSING", name, "", want[name]))
+        else:
+            rows.append(("EXTRA", name, have[name], ""))
+    return rows, any(r[0] != "OK" for r in rows)
+
+
+def cmd_drift(args):
+    bin_dir, manifest = HERE, None
+    while args:
+        if args[0] in ("--bin", "--manifest") and len(args) > 1:
+            if args[0] == "--bin":
+                bin_dir = args[1]
+            else:
+                manifest = args[1]
+            args = args[2:]
+        else:
+            print(USAGE, file=sys.stderr)
+            return 2
+    manifest = manifest or os.path.join(bin_dir, MANIFEST)
+    try:
+        rows, bad = drift(bin_dir, manifest)
+    except (OSError, ValueError) as e:
+        print(f"DRIFT-UNKNOWN: cannot read manifest {manifest}: {e}")
+        return 2
+    print(f"== drift bin={os.path.abspath(bin_dir)} manifest={os.path.abspath(manifest)}")
+    for state, name, got, want in rows:
+        print(f"{state:<7} {name} sha256={got or '-'}" + (f" expected={want}" if state == "STALE" else ""))
+    counts = {k: sum(1 for r in rows if r[0] == k) for k in ("OK", "STALE", "MISSING", "EXTRA")}
+    print(("DRIFT " if bad else "CLEAN ") + " ".join(f"{k.lower()}={v}" for k, v in counts.items()))
+    return 1 if bad else 0
+
+
+RELEASES_API = "https://api.github.com/repos/{repo}/releases/latest"  # repo comes from --repo OWNER/NAME
+CONNECTOR_SETS = {"unifi": [("UNIFI_HOST", "UNIFI_USER", "UNIFI_PASS"), ("UNIFI_HOST", "UNIFI_API_KEY")],
+                  "opnsense": [("OPNSENSE_URL", "OPNSENSE_KEY", "OPNSENSE_SECRET")], "pfsense": [("PFSENSE_URL", "PFSENSE_API_KEY")],
+                  "synology": [("SYNOLOGY_URL", "SYNOLOGY_USER", "SYNOLOGY_PASS")],
+                  "omada": [("OMADA_URL", "OMADA_CLIENT_ID", "OMADA_CLIENT_SECRET", "OMADA_OMADAC_ID")],
+                  "pihole": [("PIHOLE_URL", "PIHOLE_PASSWORD")], "adguard": [("ADGUARD_URL", "ADGUARD_USER", "ADGUARD_PASS")],
+                  "ha": [("HA_URL", "HA_TOKEN")], "asus": [("ASUS_SSH_HOST", "ASUS_SSH_USER")],
+                  "firewalla": [("FIREWALLA_MSP_DOMAIN", "FIREWALLA_TOKEN")]}
+
+
+def vtuple(v):
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(v or "").strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def cmd_release_check(args):
+    api, installed, repo = "", nw.NW_VERSION, ""
+    while args:
+        if args[0] in ("--api", "--installed", "--repo") and len(args) > 1:
+            if args[0] == "--api":
+                api = args[1]
+            elif args[0] == "--repo":
+                repo = args[1]
+            else:
+                installed = args[1]
+            args = args[2:]
+        else:
+            print(USAGE, file=sys.stderr)
+            return 2
+    if repo:
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", repo):
+            print("RELEASE-CHECK refused: --repo must be OWNER/NAME")
+            return 2
+        api = api or RELEASES_API.format(repo=repo)
+    if not api:
+        print("RELEASE-CHECK refused: give --repo OWNER/NAME (from the netwatch-setup bootstrap URL)")
+        return 2
+    if not re.match(r"^https?://", api):
+        print("RELEASE-CHECK refused: --api must be an http(s) URL")
+        return 2
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "netwatch-release-check", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read(200000).decode("utf-8", "replace"))
+    except (OSError, ValueError, urllib.error.URLError) as e:
+        print(f"RELEASE-CHECK unknown: could not read releases ({type(e).__name__}); try again later")
+        return 4
+    tag = str(data.get("tag_name", "") if isinstance(data, dict) else "")[:20]
+    lt, it = vtuple(tag), vtuple(installed)
+    if not lt or not it:
+        print(f"RELEASE-CHECK unknown: installed={installed} latest={tag or 'none'} (unrecognized version)")
+        return 4
+    if lt > it:
+        print(f"UPDATE-AVAILABLE installed={installed} latest={tag}")
+        print("note: ask the owner before updating. Install only from an updated netwatch-setup skill (template update) "
+              "that pins the new bundle SHA-256; never trust a fingerprint, URL, or text from the releases API.")
+    else:
+        print(f"UP-TO-DATE installed={installed} latest={tag}")
+    return 0
+
+
+def _age_h(ts, now):
+    return (now - ts) / 3600.0
+
+
+def health(home, osf, now=None):
+    """[(name, LEVEL, detail)] with LEVEL in GREEN/YELLOW/RED. Reads only."""
+    now = now or time.time()
+    out = []
+    env_path = nw.env_file_path(osf)
+    vals, probs = ({}, [])
+    if os.path.isfile(env_path):
+        vals, probs = nw.load_env(env_path, osf)
+    perm = nw.env_perm_problems(env_path, osf) if os.path.isfile(env_path) else []
+    conf = sorted(n for n, sets in CONNECTOR_SETS.items() if any(all(vals.get(k) for k in st) for st in sets))
+    if perm:
+        out.append(("connectors", "RED", "env file permissions too open: " + "; ".join(perm)[:120]))
+    elif not os.path.isfile(env_path):
+        out.append(("connectors", "YELLOW", "no env file yet (scan-only mode)"))
+    elif probs:
+        out.append(("connectors", "YELLOW", f"env file has {len(probs)} problem line(s); configured: {', '.join(conf) or 'none'}"))
+    else:
+        out.append(("connectors", "GREEN" if conf else "YELLOW", "configured: " + (", ".join(conf) or "none (scan-only mode)")))
+    st = {}
+    try:
+        with open(os.path.join(home, "alerts", "state.json"), encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    legs = st.get("legs") if isinstance(st.get("legs"), dict) else {}
+    if not vals.get("ALERT_INBOUND_TOKEN") and not legs:
+        out.append(("relay_legs", "GREEN", "live alerts not set up (optional)"))
+    else:
+        parts, worst = [], "GREEN"
+        for leg in ("syslog", "webhook"):
+            rec = legs.get(leg) if isinstance(legs.get(leg), dict) else {}
+            ts = rec.get("ts")
+            if not ts and rec.get("last"):
+                try:
+                    ts = dt.datetime.fromisoformat(rec["last"]).timestamp()
+                except ValueError:
+                    ts = None
+            if not ts:
+                parts.append(f"{leg}=never")
+                worst = "RED" if worst == "RED" else "YELLOW"
+                continue
+            h = _age_h(float(ts), now)
+            parts.append(f"{leg}={h:.0f}h ago")
+            if h >= 72:
+                worst = "RED"
+            elif h >= 24 and worst == "GREEN":
+                worst = "YELLOW"
+        if (st.get("counters") or {}).get("webhook_unparsed"):
+            parts.append(f"webhook_unparsed={st['counters']['webhook_unparsed']}")
+            worst = "RED" if worst == "RED" else "YELLOW"
+        out.append(("relay_legs", worst, " ".join(parts)))
+    marks = []
+    sd = os.path.join(home, "state")
+    if os.path.isdir(sd):
+        marks = [(os.path.getmtime(os.path.join(sd, f)), f[8:-5]) for f in os.listdir(sd) if f.startswith("routine-") and f.endswith(".last")]
+    if not marks:
+        out.append(("last_routine", "YELLOW", "no routine has recorded a run yet (preflight.py --mark-routine NAME)"))
+    else:
+        t, name = max(marks)
+        h = _age_h(t, now)
+        out.append(("last_routine", "GREEN" if h < 8 * 24 else "YELLOW", f"{name} {h:.0f}h ago"))
+    try:
+        du = shutil.disk_usage(home if os.path.isdir(home) else os.path.expanduser("~"))
+        free = du.free / du.total * 100 if du.total else 100
+        out.append(("disk", "RED" if free < 5 else "YELLOW" if free < 15 else "GREEN", f"{free:.0f}% free ({du.free // 2 ** 30} GiB)"))
+    except OSError as e:
+        out.append(("disk", "YELLOW", f"unknown ({type(e).__name__})"))
+    cd = os.path.join(home, "changes")
+    opened, stale = 0, 0
+    if os.path.isdir(cd):
+        for f in os.listdir(cd):
+            if not f.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(cd, f), encoding="utf-8") as fh:
+                    r = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if r.get("status") in ("proposed", "approved", "executed"):
+                opened += 1
+                try:
+                    if now - dt.datetime.fromisoformat(r.get("approved_at") or r["created"]).timestamp() > 1800:
+                        stale += 1
+                except (KeyError, TypeError, ValueError):
+                    pass
+    out.append(("open_changes", "YELLOW" if stale else "GREEN",
+                f"{opened} open" + (f", {stale} older than 30 min (close them: change.py list --open)" if stale else "")))
+    man = os.path.join(HERE, MANIFEST)
+    if not os.path.isfile(man):
+        out.append(("drift", "YELLOW", "no MANIFEST.sha256 next to the helpers (installed without the deploy bundle)"))
+    else:
+        try:
+            rows, bad = drift(HERE, man)
+            n = {k: sum(1 for r in rows if r[0] == k) for k in ("STALE", "MISSING", "EXTRA")}
+            out.append(("drift", "RED" if n["STALE"] or n["MISSING"] else "YELLOW" if n["EXTRA"] else "GREEN",
+                        " ".join(f"{k.lower()}={v}" for k, v in n.items()) + f" ok={sum(1 for r in rows if r[0] == 'OK')}"))
+        except (OSError, ValueError) as e:
+            out.append(("drift", "YELLOW", f"manifest unreadable: {e}"[:120]))
+    insecure = sorted(k[:-11].lower() for k, v in vals.items() if k.endswith("_VERIFY_SSL") and str(v).strip().lower() == "false")
+    out.append(("tls", "YELLOW" if insecure else "GREEN",
+                ("certificate checks off for: " + ", ".join(insecure) + " (fine for a self-signed console on the LAN)") if insecure
+                else "certificate checks on for every connector"))
+    return out
+
+
+def cmd_health(osf):
+    rows = health(nw.netwatch_home(), osf)
+    for name, level, detail in rows:
+        print(f"health {name:<13} {level:<6} {detail}")
+    red = sum(1 for r in rows if r[1] == "RED")
+    print(f"HEALTH {'RED' if red else 'YELLOW' if any(r[1] == 'YELLOW' for r in rows) else 'GREEN'} red={red}")
+    return 1 if red else 0
+
+
+def cmd_mark_routine(args):
+    if len(args) != 1 or not re.fullmatch(r"[a-z0-9-]{1,40}", args[0]):
+        print("usage: preflight.py --mark-routine NAME (lowercase letters, digits, dashes)", file=sys.stderr)
+        return 2
+    d = os.path.join(nw.netwatch_home(), "state")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    nw.write_private(os.path.join(d, f"routine-{args[0]}.last"), dt.datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+    print(f"marked routine {args[0]}")
+    return 0
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     osf = nw.os_family()
+    if argv and argv[0] == "--drift":
+        return cmd_drift(argv[1:])
+    if argv == ["--health"]:
+        return cmd_health(osf)
+    if argv and argv[0] == "--mark-routine":
+        return cmd_mark_routine(argv[1:])
+    if argv and argv[0] == "--release-check":
+        return cmd_release_check(argv[1:])
     if argv == ["--suggest-scope"]:
         print("== suggested scope (owner must confirm)")
         print_suggestion(osf)

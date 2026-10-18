@@ -60,3 +60,21 @@ nw alertd.py ingest FILE
 4. Decide: duplicates of an event already reported in the last 24 hours, and low or medium items with nothing new, are logged only.
 5. Notify the owner with severity, what happened, which device, evidence, and confidence.
 6. Propose containment for critical or high events involving a LAN device (block client, isolate VLAN, firewall rule) through netwatch-containment and netwatch-change-control: record rollback first and wait for the owner's own yes. Smart-home devices are never blocked by Net Watch; tell the owner and the home-control bot's owner instead.
+
+## Relay health (2026-10-18)
+
+The first refused webhook (bad or missing token) from a configured alert source raises one high alert at once (again at most every 6 hours, `refused_trusted_dedupe_h`). If the syslog or webhook leg receives nothing for `leg_silence_h` hours (default 24), or `webhook_unparsed` grows, one high alert goes out per leg and stays quiet until that leg recovers. `status` prints `leg_syslog` and `leg_webhook` with `last_seen`, count, the webhook `unparsed` count, plus `refused_24h`. Any inbound internet IPS event that was not blocked (allowed, or action missing or unknown) is high regardless of signature (owner-approved change 20261018-074528-2bf7).
+
+## Owner identity (expected owner changes)
+
+UniFi audit events such as Config Created, Modified, or Removed made by the owner from the owner's own devices are noise. List the owner once:
+
+```text
+nw alertd.py owner add-admin "ADMIN NAME AS SHOWN IN UNIFI"
+nw alertd.py owner add-device aa:bb:cc:dd:ee:ff
+nw alertd.py owner add-device LAN_IP_OF_THAT_DEVICE
+nw alertd.py owner list
+nw alertd.py owner remove VALUE
+```
+
+This writes NETWATCH_HOME/owner.json (mode 600); the running relay reloads it on change. An admin event is journaled as low "expected owner change" (not forwarded) only when BOTH the admin name matches AND the source is a listed private LAN device (by IP, or by MAC when the event carries one). Consecutive owner changes within 30 minutes fold into one journal entry, which names any change.py change approved and applied within the last 60 minutes. Syslog identity is unauthenticated, so the device check is mandatory: with no devices listed nothing is suppressed. Still forwarded: the same admin from an unlisted LAN device or any public or CGNAT address (medium or higher; public admin access stays high), unknown admins (at least medium), failed admin logins and new admin accounts (high). add-device refuses public IPs and IPs outside scope.txt. Never add devices the owner does not personally use.

@@ -15,3 +15,14 @@ Firewalla box firmware current, alarms reviewed (abnormal upload, intel hits, ne
 ## Containment
 
 Owner blocks or quarantines a device in the app with exact steps. Record in netwatch-change-control.
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw discover.py CIDR
+```
+
+- PASS: the Firewalla box appears in discovery; with the MSP API configured, its documented read call returns `HTTP 200`.
+- FAIL: the box is missing from discovery, or the MSP call returns `HTTP 401` (token) or times out. Give the owner one line, mark the connector untested, and continue setup.

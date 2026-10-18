@@ -22,3 +22,14 @@ Only `device_tracker.*` and `update.*` entities matter here; the `--where` filte
 
 - Never call `/api/services`, never fire events, never change automations (the helper cannot).
 - HA itself is a security-relevant host: check its version and update entities, and whether port 8123 is exposed to the WAN (netwatch-port-exposure).
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw nw_http.py ha GET /config --fields version,location_name
+```
+
+- PASS: `HTTP 200` and a version prints.
+- FAIL: `HTTP 401` (long-lived token missing or revoked) or a timeout (HA_URL). Give the owner one line, mark the connector untested, and continue setup.

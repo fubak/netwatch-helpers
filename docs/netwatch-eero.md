@@ -19,3 +19,14 @@ There is no official Eero API or MCP server. Unofficial libraries need the owner
 ## Containment and changes
 
 Give exact app steps, for example pausing or blocking a device in the Devices list, turning off UPnP, removing a port forward. Record each in netwatch-change-control with the rollback steps and wait for the owner to report done. Note: Eero Plus is a paid subscription; do not recommend buying it without saying it is optional and paid.
+
+## Pass/fail test
+
+Run on the scan host (read-only):
+
+```text
+nw discover.py CIDR
+```
+
+- PASS: eero has no local API, so the test is that discovery finds the eero gateway IP; the owner then confirms one screenshot from the eero app.
+- FAIL: the gateway IP is missing from discovery (wrong range or the scan host is on a guest network). Give the owner one line, mark the connector untested, and continue setup.
